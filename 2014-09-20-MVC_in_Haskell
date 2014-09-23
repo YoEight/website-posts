@@ -1,0 +1,181 @@
+Model View Controller (MVC) is a very famous pattern found in most mainstream programming language ecosystems. Dedicated to application with user interations, it aims to separate different concerns in a program architecture.
+
+1. Abstract over how you get information from the user.
+2. Abstract over how you display information to the user.
+3. Implement your application model according to 1 and 2
+
+In other words, your application model accepts a limited set of values as input and produces a limited set of values as output. The Controller part knows how to produce an input value and the View how to handle an output value.
+
+Gabriel Gonzalez ([@GabrielG439](http://twitter.com/GabrielG439)) published a really nice API named [mvc](https://hackage.haskell.org/package/mvc). I'm not going to talk more about it. It worth to be mentioned, as usual with Gabriel, it's really well written and documented. Unfortunately, it's not suited to every type of application (yet), like web application. It also requires some advanced Haskell knowledge (nothing too fancy though).
+
+I'd like to share some principles extracted from `mvc` without its current limitations. Along this post, we are going to set up a simple web application with a MVC architecture. It will use [WAI 3](https://hackage.haskell.org/package/wai-3.0.1.1) and [Warp server](https://hackage.haskell.org/package/warp).
+
+### Input and Output
+
+To define your application model, you need to define your `Input` and `Output` values first. As usual, we use ADT
+
+```haskell
+type Action   = String
+type Username = String
+
+data Input
+    = LogIn Username
+    | LogOut Username
+    | LoggedUsers
+
+data Output
+    = Success Action
+    | NotFound
+    | ShowLoggedUsers [Username]
+
+```
+
+The application state is simple:
+
+```haskell
+type AppState = [Username]
+```
+
+### Application
+
+`Wai`'s `Application` type is defined like this
+
+```haskell
+type Respond     = Response -> IO ResponseReceived
+type Application = Request -> Respond -> IO ResponseReceived
+
+```
+
+Now we can define `model`, `controller` and `view` functions.
+
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
+import Network.HTTP.Types (methodGet, methodPut)        -- http-types package
+import Network.Wai (rawPathInfo, requestMethod)
+import Network.Wai.Parse (lbsBackEnd, parseRequestBody) -- wai-extra package
+
+controller :: Request -> IO (Maybe Input)
+controller req
+    | requestMethod req == methodGet
+     = case rawPathInfo req of
+           "logged-users" -> return $ Just LoggedUsers
+           _              -> return Nothing
+
+    | requestMethod req == methodPost
+     = case rawPathInfo req of
+           p | "login" == p || "logout" == p
+               -> do (params,_) <- parseRequestBody lbsBackEnd req
+
+                     let constr
+                             = if "login" == p
+                               then Login
+                               else Logout
+
+                     case lookup "username" params of
+                         Nothing       -> return Nothing
+                         Just username -> return $ Just $ constr username
+
+            | otherwise
+             -> return Nothing
+    | otherwise
+     = return Nothing
+```
+
+`controller`'s goal is to extract an `Input` from an HTTP request. it handles only 3 urls:
+
+```
+GET  /logged-users
+POST /login
+POST /logout
+```
+
+Both login and logout requests must have a body parameter named *username*. Let's move to `model` function.
+
+```haskell
+{-# LANGUAGE FlexibleContexts #-}
+
+import Control.Monad.State.Class -- mtl package
+import Data.Functor (<$)
+
+model :: MonadState AppState m => Input -> m Output
+model (LogIn username)  = Success "Login"  <$ modify (username:)
+model (LogOut username) = Success "Logout" <$ modify (delete username)
+model LoggedUsers       = fmap ShowLoggedUsers get
+```
+
+Any application model requires a state at some point, hence the `MonadState` constraint. Being universally quantified over any `MonadState` instance provide flexibilty. It allows `model` to be integrated into a complex monad transformer stack when running in production, or a barebone `State` monad when testing your model with `QuickCheck`. Let's jump to the `view`.
+
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
+import Data.ByteString.Lazy.Char8 (pack)
+import Data.Foldable (foldMap)
+import Network.HTTP.Types
+import Network.Wai
+
+type Respond = Response -> IO ResponseReceived
+
+view :: Respond -> Output -> IO ResponseReceived
+view respond output
+    = case output of
+          Success action
+              -> let msg = pack (action ++ " succeed") in
+                 respond $ responseLBS status202 headers msg
+
+          ShowLoggedUsers users
+              -> let content = pack $ foldMap (++ " \n") users in
+                 respond $ responseLBS status202 headers msg
+
+          NotFound
+              -> respond $ responseLBS status404 headers "Not Found !"
+
+  where
+    headers = [(hContentType, "text/plain")]
+```
+
+So far so good, we got every component of our MVC architecture. All we have to do now is to plumb in. `model` handles a `AppState` as state. To avoid any concurrency issue, we're going to use a `TMVar`, a structure you can found in `stm` package.
+
+```haskell
+import Control.Monad.State
+import Control.Concurrent.STM
+import Network.Wai
+
+myApplication :: IO Application
+myApplication = newTMVarIO [] >>= application
+
+application :: TMVar AppState -> Application
+application varState request respond
+    = do mInput <- controller request
+         case mInput of
+             Nothing
+                 -> view respond NotFound
+
+             Just input
+                 -> let stmAction
+                            = do s <- takeTMVar varState
+                                 let (output, newS) = runState (model input) s
+                                 putTMVar varState newS
+                                 return output in
+
+                    atomically stmAction >>= view respond
+
+```
+
+What is going on so far ? We pass a `Request` value to `controller` function. when `controller` returns `Nothing`, we tell `view` to render `NotFound` value. It happens when our visitors entered an unhandled url for instance. When `controller` produces successfully an `Input` value, we extract the current `AppState` state of our webapp, applied it to our `model` function and get a new `AppState` in return. Then, we save that new state an return the `Output` value. All of this is happening in the `STM` monad. We run atomically our stm action and pass produced `Output` to `view`.
+
+```haskell
+import Network.Wai.Handler.Warp
+
+main :: IO ()
+main = myApplication >>= run 80
+
+```
+
+We're all set !
+
+### Conclusion
+
+Setting up a MVC architecture in Haskell is quite straightforward. Thanks to purity, we can have a model free of I/O interactions. It increase greatly its testatibility. Hook it up to an automatic and property-based testing framework like `QuickCheck` and you can grow a strong confidence in your code correctness.
+
+My blog is a `Wai 3` application. It uses the same architecture and you can see the source code [here](http://github.com/YoEight/personal-site). As usual,  if you find any error on this post, please ping me on twitter ([@yoeight](http://twitter.com/yoeight)), fill an issue or a PR on github.

@@ -1,0 +1,254 @@
+I started a new project named Rakhana. It's a stream-based PDF library. Why that name ? Because I'm a Mass Effect fan and I find that planet description very precise as how chaotic PDF specification is. The first release includes a very limited set of features. You can extract basic PDF metada, list every object that composes the PDF document. Everything is implemented in a memory-space efficient way. I'm aiming to add more advanced features like text extraction, forms retrieval, incremental update and so on.
+
+That kind of project is also a great opportunity to use very popular haskell libraries like [Pipes](https://hackage.haskell.org/package/pipes) and [Lens](https://hackage.haskell.org/package/lens). I'm not going to introduce those libraries but share my feedback and expose my design choices.
+
+### Why I peeked those librairies at first place ?
+
+The main reason is I really like those but as conscientious engineer here are more objective reasons:
+
+#### Pipes
+
+A PDF document can't be accessed in regular fashion, I mean sequentially, top-down and left to right. PDF format has been designed in a way that allows random accesses, using offset position. That document might also contain numerous and large binary streams. Consequently, an efficient PDF library should be able to load only what is needed. Better, it should be able to load on demand a specific piece of data. Pipes is equiped to handle any of those use cases.
+
+#### Lens
+
+Like a lot of formats, PDF can be encoded as an AST. Such representation is always leading to pervasive uses of pattern-matching, verbosity and lack of composition. Lens library with `Prism` alleviates those shortcomings in a very elegant way.
+
+### Architecture of Rakhana
+
+So I choose a layered design, each layer is ordered according to its abstraction level. Each layer communicates with its lower conterpart throught a protocol encoded as an ADT (actually Haskell doesn't have ADT, we should call them sum types). Here is how it goes:
+
+```
+-----------------
+|               |
+| "User space"  |
+|               |
+-----------------
+     |   ^
+NReq |   | NResp
+     v   |
+-----------------
+|               |
+|   Nursery     |
+|               |
+-----------------
+     |   ^
+TReq |   | TResp
+     v   |
+-----------------
+|               |
+|      Tape     |
+|               |
+-----------------
+```
+
+#### Tape
+
+Tape is the lowest level. Its primitives permit to seek to a particular position or get any piece of data in a random fashion. This is its protocol:
+
+```haskell
+data TReq -- Input
+    = Seek Integer
+    | GetSeek
+    | Top
+    | Bottom
+    | Get Int
+    | GetLazy Int
+    | Direction Direction
+    | Peek Int
+    | Discard Int
+
+data TResp -- Output
+    = Unit
+    | Binary B.ByteString
+    | BinaryLazy BL.ByteString
+    | RSeek Integer
+
+data Direction
+    = Forward
+    | Backward
+
+```
+
+Data contructors are self descriptive enough. `TReq`, `TResp` (and `Direction`) contructors are not exposed. Tape doesn't embed any PDF logic. It's a simple abstraction on top of a binary stream.
+
+#### Nursery
+
+That part manages PDF document objects. Of course, it doesn't load everything on memory. Nursery uses PDF cross-reference table to retrieve every object position in the stream. For now, most PDF logic lands here. Like Tape, Nursery understands a limited set of requests:
+
+```haskell
+data NReq
+    = RqInfo
+    | RqHeader
+    | RqPages
+    | RqResolve Reference
+    | RqLoadStreamData Stream
+    | RqReferences
+
+data NResp
+    = Unit
+    | RBinaryLazy BL.ByteString
+    | RInfo Dictionary
+    | RHeader Header
+    | RPages Dictionary
+    | RResolve Object
+    | RReferences [Reference]
+```
+
+The first schema I gave shows that each channel between layer is bidirectional. Pipes library allows that kind of feature, it's even its main encoding ! By now, Pipes is the only stream processing library I'm aware of that allows bidirectional communication between upstream and downstream. That's my opinion but Machines library can do this too. But I let this for another post.
+
+### Show me the types !
+
+Let's focus on Tape layer first:
+
+```haskell
+type Tape m a  = Server' TReq TResp m a
+type Drive m a = Client' TReq TResp m a
+```
+
+`Server'` and `Client'` are proper Pipes types. Basically, `Tape` says it can handle `TReq` request and reponds with `TResp` values. In the same way, `Drive` tells us it requests `TReq` values and expects `TResp` responses. Here's `Server'` and `Client'` type definitions:
+
+```haskell
+type Server' b' b m r = forall x' x. Proxy x' x b' b m r
+         --  Tape m a = forall x' x. Proxy x' x TReq TResp m a
+type Client' a' a m r = forall y' y. Proxy a' a y' y m r
+         -- Drive m a = forall y' y. Proxy TReq TResp y' y m a
+```
+
+I personally find that encoding very flexible. I could add a new layer just below `Tape` without breaking any interactions with upper layers. That also applies to `Drive`. I'm able to plug any computation that is not just interacting  with `Tape` but responding to some type coming out of my mind. `Tape` would not have to know. Nursery takes advantage of that design.
+
+Let's move to an implementation of `Tape` protocol. For the sake of simplicity, I'm going to show how to handle `Get` request. This is how one can emit a `Get` request using `Drive` API:
+
+```haskell
+driveGet :: Monad m => Int -> Drive m Strict.ByteString
+driveGet i
+    = do Binary b <- request $ Get i
+         return b
+```
+
+Somewhere in a `Tape` implementation, we got:
+
+```haskell
+tapeImpl :: Monad m => Tape m r
+tapeImpl = loop Unit
+  where
+    loop resp
+        = do req   <- respond resp
+             resp' <- dispatch req
+             loop resp'
+
+   dispatch (Get i) = ... -- Actual Get implementation
+   dispatch ...           -- Other instruction implementations
+```
+
+The true magic lives in `runDrive`:
+
+```haskell
+runDrive :: Monad m => (forall r. Tape m r) -> Drive m a -> m a
+runDrive tape drive = runEffect (tape >>~ const drive)
+```
+
+Function `>>~` is defined in Pipes library. Applied to `Tape` and `Drive` types, we got:
+
+```haskell
+(>>~) :: Monad m => Tape m a -> (TResp -> Drive m a) -> Effect' m a
+```
+Basically it 'replaces' every `respond` call in `Tape` by `TResp -> Drive m a`. Type `Effect'` simply says that all `TReq` requests have been handled by `TResp` responses. In my past life, it was called Dependency Injection. In Haskell, it's simply Function Application ! Communication between `Nursery` and upper layers use the same technique.
+
+Another uncovered aspect of that design, is the possibility to add an intermediary element between 2 layers. For instance, one can add a cache between `Nursery` and the "User Space". Such component could served any previously visited object. `Nursery` will not have to parse the same object again everytime is asked. That's bring new feature __without__ modifying neither `Nursery` or "User Space" !
+
+```
+-----------------
+|               |
+| "User space"  |
+|               |
+-----------------
+     |   ^
+NReq |   | NResp
+     v   |
+  -------------
+  |           |
+  |   Cache   |
+  |           |
+  -------------
+     |   ^
+NReq |   | NResp
+     v   |
+-----------------
+|               |
+|   Nursery     |
+|               |
+-----------------
+```
+
+We could also implement a Log, possible components are countless.
+
+### AST manipulation
+
+At the end of the day, access strategy aside, a PDF format is similar to any other document format. Here's how Rakhana encodes it:
+
+```haskell
+data Object
+    = Number Number
+    | Boolean Bool
+    | Name ByteString
+    | Dict Dictionary
+    | Array (Vector Object)
+    | Bytes ByteString
+    | Ref Int Int
+    | AStream Stream
+    | Null
+```
+
+Inspect such data structure is cumbersome (pervasive use of pattern-matching). Moreover, there is a lot of code duplication. Some people could also claim that's the perfect use case of a dynamically typed programming language. Hell no ! Super Kmett comes to the rescue !
+
+In lens library, lives a really useful abstraction named `Prism`.
+
+```haskell
+type Prism s t a b = forall p f. (Choice p, Applicative f) => p a (f b) -> p s (f t)
+```
+
+E. Kmett style is quite intimidating the first time you see it. In our case, we'll use `Choice (->)` instance. At the end, the type signature is more familiar.
+
+```haskell
+type OurPrism s t a b = forall f. Applicative f => (a -> f b) -> s -> f t
+```
+
+Astute reader notices that when we pick `Choice (->)` instance, `Prism` is quite similar to a `Lens` ! It's just more powerful, due to `Applicative` constraint.
+
+```haskell
+type Lens s t a b = forall f. Functor f => (a -> f b) -> s -> f t
+````
+
+`Object` data contructors are not exposed. We use `Prism` all the way down. Here a simple `Prism` definition:
+
+```haskell
+_MyPrism :: Prism' Object Strict.ByteString
+_MyPrism = _Dict . dictKey "Type" . _Name
+```
+
+Depending on the use of `#` or `!?`, we get very interesting results:
+
+```haskell
+myDictObject :: Strict.ByteString -> Object
+myDictObject b = _MyPrism # b
+
+extractName :: Object -> Maybe Strict.ByteString
+extractName obj = obj ^? _MyPrism
+```
+
+We can extract or create when using the same `Prism` ! You can check Rakhana `Prism` definitions [here](https://github.com/YoEight/rakhana/blob/master/Data/Rakhana/Internal/Types.hs#L83). `Nursery` uses `Prism` a lot, here a snippet:
+
+```haskell
+getInfo :: MonadThrow m => XRef -> Nursery m Dictionary
+getInfo xref = perform action trailer
+  where
+    trailer = xrefTrailer xref
+
+    action = dictKey "Info"
+             . _Ref
+             . act (resolveObject xref)
+             . _Dict
+```
+
+There's still a lot of work to do on Rakhana. I hope I made my design decisions understandable. I think it's flexible but I counting on feedbacks. There're probably drawbacks I haven't seen yet. If you find any error on this post, please ping me on twitter ([@yoeight](https://twitter.com/yoeight)) or fill a PR on [github](https://github.com/YoEight/personal-site/tree/master/articles)

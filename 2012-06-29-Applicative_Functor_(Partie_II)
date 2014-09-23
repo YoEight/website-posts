@@ -1,0 +1,137 @@
+Après une petite introduction aux Applicative Functors, nous allons aujourd’hui plus s’intéresser à leurs utilisations dans des situations "réelles". Nous verrons tout au long de l’article:
+
+1. Le type algébrique Validation
+2. L’abstraction Semigroup
+3. Un exemple de validation de données (un formulaire)
+
+### Différencier l’erreur du succès
+
+La validation est certainement le principal point d’entrée pour utiliser une librairie comme Scalaz. En voici une définition:
+
+```scala
+sealed trait Validation[E, A]{
+  def map[B](f: A => B): Validation[E, B] = this match {
+    case Success(a) => Success(f(b))
+    case Failure(e) => Failure(e)
+  }
+}
+case class Success[E, A](v: A) extends Validation[E, A]
+case class Failure[E, A](e: E) extends Validation[E, A]
+```
+
+Certains ne manquerons pas de remarquer que le type ressemble en tout point au type de la librairie standard Scala: Either. Ces types sont identiques ! Pour être plus precis, on dit qu’ils sont isomorphiques. Pour faire simple, cela signifie que nous pouvons définir 2 fonctions dont une `Validation[E, A] => Either[E, A]` et l’autre `Either[E, A] => Validation[E, A]`
+
+La première chose vous vous demandez est certainement "Pourquoi définir Validation si ce type est identique à Either ?". La réponse est tout simplement car nous pourrons définir  une implémentation d’applicative pour `Validation` qui permettra l’accumulation d’erreur, ce que ne permet pas son homologue `Either`.
+
+### Abstraire l’accumulation
+
+Lorsque l’on parle d’accumulation des erreurs, on voit directement des types String ou encore List comme potentiels candidats. Le problème, c’est que la méthode pour accumuler une chaine de caractères n’est pas la même que pour accumuler une liste. Si nous voulons garder le type de l’erreur générique, il nous faut donc trouver une abstraction qui nous permet d’encapsuler cette opération. C’est la que l’abstraction Semigroup rentre en jeu. Un Semigroup est donc une opération binaire associative. Par exemple pour l’ensemble des entiers, l’addition et la multiplication sont des opérations binaires associatives.
+
+Soit le type Semigroup
+
+```scala
+trait Semigroup[A] {
+  def append(x: A, y: A): A
+}
+```
+
+Implémentons ce type de classe aux String et aux List
+
+```scala
+val stringSemigroup = new Semigroup[String]{
+  def append(x: String, y: String): String = x + y
+}
+
+def listSemigroup[A] = new Semigroup[List[A]]{
+  def append(x: List[A], y: List[A]): List[A] = x ::: y
+}
+```
+
+Passons à l’implementation de l’applicative de Validation:
+
+```scala
+def validationApplicative[E, A](implicit E: Semigroup[E]) = new Applicative[({type f[x] = Validation[E, x]})#f]{
+  def pure[A](v: => A): Validation[E, A] = Success[E, A](v)
+
+  def ap[A, B](ff: Validation[E, A => B], fa: Validation[E, A]): Validation[E, B] = (ff, fa) match {
+    case (Success(f), Success(a))  => Success(f(a))
+    case (Failure(e), Success(_))  => Failure(e)
+    case (Success(_), Failure(e))  => Failure(e)
+    case (Failure(e), Failure(ee)) => Failure(E.append(e, ee))
+  }
+}
+```
+
+Le type anonyme `({type f[x] = Validation[E, x]})#f` permet de déclarer un type `M[_, _]` en `N[_]` demandé par le type de classe Applicative. Scala ne peut pas convertir implicitement un type de rang 2 en un type de rang 1. Cette notation fonctionne de la même manière que la curryfication. On va partiellement appliquer le type Validation, en fournissant le type E mais en laissant le second type disponible.
+
+Le semigroupe que forme le type E est utilisé lorsque l’on rencontre 2 échecs (Failure) et permet donc l’accumulation d’erreur.
+
+### Validation d’un formulaire
+
+Attaquons nous maintenant à un cas concret. Notre objectif est d’à partir de 3 chaines de caractères de construire une entité Person. Si nous n’arrivons pas à la construire, on retourne un message d’erreur au client.
+
+Voici les différentes classes de notre domaine:
+
+```scala
+sealed trait Gender
+case object Male extends Gender
+case object Female extends Gender
+
+case class Person(name: String, gender: Gender, age: Int)
+```
+
+Définissons nos méthodes de validation
+
+```scala
+def getAge(s: String): Validation[String, Int] =
+  Option(s).filter(_.forAll(_.isDigit)).map(x => Success(x.toInt))
+    .getOrElse(Failure("provided age is empty or not a number"))
+
+def getName(s: String): Validation[String, String] =
+  Option(s).filter(!_.forAll(_.isWhitespace)).map(Success(_))
+    .getOrElse(Failure("name is empty"))
+
+def getGender(s: String): Validation[String, Gender] = {
+  val tmp = Option(s).flatMap {
+    case "M" => Some(Success(Male))
+    case "F" => Some(Success(Female))
+    case _   => None
+  }
+
+  tmp.getOrElse(Failure("provided gender is empty or invalid")) // lol
+}
+
+type VS[A] = Validation[String, A]
+def getPerson(name: String, gender: String, age: String): Validation[String, Person] =
+  lift3A[VS, Person](getName(name), getGender(gender), getAge(age))(Person(_, _, _))
+```
+
+La méthode liftA3 a été vue dans le précédent article. Voici sa définition:
+
+```scala
+def liftA3[F[_]: Applicative, A, B, C, D](fa: F[A], fb: f[B], fc: F[C])(f: (A, B, C) => D): F[D] = {
+    import Applicative[F]._
+
+    ap(ap(ap(pure(f.curried), fa), fb), fc)
+}
+```
+
+Elle nous permet de combiner le résultat de 3 mêmes types qui possèdent une instance d’Applicative avec une fonction pure.
+
+Dans la librairie Scalaz, Il y a une syntaxe particulière pour les applicatives qui donne ceci
+
+```scala
+def getPerson(name: String, sex: String, age: String): Validation[String, Person] =
+  getName(name) |@| getSex(sex) |@| getAge(age) apply (Person(_, _, _))
+```
+
+Voici les différents résultats que nous aurions en exécutant la fonction `getPerson`:
+
+```scala
+getPerson("Yorick", "25", "M") // Success(Person(Yorick, 25, Male))
+getPerson("", "25", "M") // Failure(name is empty)
+getPerson("", "25", "toto") // Failure(name is empty, provided sex is empty or invalid)
+getPerson("", "fsdf", "toto") // Failure(name is empty, provided age is empty or not a number, provided sex is empty or invalid)
+```
+
+Cette accumulation d’erreur n’est possible qu’en utilisant un style applicatif. En utilisant une monade, à la première erreur l’évaluation de l’expression de `getPerson` se serait arrêtée.

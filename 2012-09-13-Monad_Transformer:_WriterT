@@ -1,0 +1,204 @@
+Aujourd’hui nous allons voir un cas d’utilisation de monad transformer. Pourquoi avoir besoin de cette abstraction ? Tout simplement pour pouvoir combiner les effets de monades différentes. La monade Writer généralement utilisée pour logguer un calcul dans un language pure (comme Haskell), est extrêmement simple. C’est un tuple composé du type du résultat attendu et du type utilisé pour accumuler les logs. Le type utilisé pour les logs devra être un Monoid, c’est à dire avoir un élément neutre (que l’on nommera zero) et une opération binaire associative (que l’on nommera append).
+
+```scala
+trait Monoid[A] {
+    def zero: A
+
+    def append(x: A, y: A): A
+  }
+
+  case class Writer[W, A](a: A, w: W){
+    def map[B](f: A => B): Writer[W, B] =
+       Writer(f(a), w)
+
+    def flatMap[B](f: A => Writer[W, B])(implicit W: Monoid[W]): Writer[W, B] = f(a) match {
+      case Writer(b, ww) => Writer(b, W.append(w, ww))
+    }
+
+    def :++>(ww: W)(implicit W: Monoid[W]): Writer[W, A] =
+      Writer(a, W.append(w, ww))
+
+    def :++>>(f: A => W)(implicit W: Monoid[W]): Writer[W, A] =
+      Writer(a, W.append(f(a), w))
+
+    def written: Writer[W, W] =
+      Writer(w, w)
+  }
+
+object Writer {
+  implicit def writerMonad[W](implicit W: Monoid[W]): Monad[({type f[x] = Writer[W, x]})#f]{
+    def point[A](v: => A): Writer[W, A] = Writer(v, W.zero)
+
+    def bind(fa: Writer[W, A])(f: A => Writer[W, B]) = fa flatMap f
+  }
+}
+```
+
+Voici maintenant un petit exemple:
+
+```scala
+def as[A](v: => A): Writer[String, A] = Monad[({type f[x] = Writer[String, x]})#f].point(v)
+
+def foo = for {
+  x <- as(1) :++> "J'ajoute 1"
+  y <- as(2) :++> ", J'ajoute 2"
+} yield x + y
+
+println(foo) // Writer(3, J'ajoute 1, J'ajoute 2)
+```
+
+Dans ce cas de figure, l’utilisation de la monade Writer est ridicule mais permet d’en apprécier le fonctionnement. Le véritable objectif est de transformer Writer en Monad Transformer de sorte que d’autres monades aient la possibilité de logger comme Option, Either ou encore List.
+
+Pour cela, il nous faut généraliser Writer. Writer[W, A] est tout simplement vu comme un tuple (A, W). Soit maintenant WriterT (pour Writer Transformer) la version plus générale. Il peut être vu comme F[(A, W)] avec F un type d’ordre supérieur (un type qui accepte un type en paramètre pour créer un nouveau type :D). Pour pouvoir implémenter les mêmes opérations de Writer, il faudra au minimum que F soit un functor voire une monade.
+
+```scala
+trait Functor[F[_]]{
+  def map[A, B](fa: F[A])(f: A => B): F[B]
+}
+
+trait Monad[F[_]] extends Functor[F] {
+  def point[A](v: => A): F[A]
+
+  def bind(fa: F[A])(f: A => F[B]): F[B]
+
+  def map[A, B](fa: F[A])(f: A => B): F[B] = bind(fa)(a => point(f(a)))
+}
+
+sealed trait WriterT[F[_], W, A]{ self =>
+  def run: F[(A, W)]
+
+  def map[B](f: A => B)(implicit F: Functor[F]): WriterT[F, W, B] =
+    WriterT(F.map(run){ case (a, w) => (f(a), w) })
+
+  def flatMap[B](f: A => WriterT[F, W, B])(implicit F: Monad[F], W: Monoid[W]): WriterT[F, W, B] = {
+    val tmp = F.bind(run){
+      case (a, w) =>
+        F.map(f(a).run){ case (b, ww) => (b, W.append(w, ww)) }
+    }
+
+    WriterT(tmp)
+  }
+
+  def :++>(w: W)(implicit F: Monad[F], W: Monoid[W]): WriterT[F, W, A] =
+    flatMap(a => WriterT(F.point((a, w))))
+
+  def :++>>(f: A => W)(implicit F: Monad[F], W: Monoid[W]): WriterT[F, W, A] =
+    flatMap(a => Writer(F.point((a, f(a)))))
+}
+
+object WriterT{
+  def apply[F[_], W, A](v: F[(A, W)]): WriterT[F, W, A] = new WriterT[F, W, A]{
+    def run = v
+  }
+
+  def lift[F[_], W, A](v: F[A])(implicit F: Functor[F], W: Monoid[W]): WriterT[F, W, A] =
+    WriterT(F.map(v)(a => (a, W.zero)))
+}
+```
+
+On peut obtenir notre Writer de tout à l’heure en le déclarant ainsi
+
+```scala
+type Writer[W, A] = WriterT[Id, W, A]
+
+type Id[X] = X
+
+implicit val idMonad = new Monad[Id] {
+  def point(v: => A): A = v
+  def bind(fa: A)(f: A => B): B = f(fa)
+}
+```
+
+En reprenant notre exemple ‘bidon’ de tout à l’heure et en l’adaptant à WriterT, on voit finalement que le type "contenant" à très peu d’importance. Le couplage est extrêmement faible. La seule chose que l’on demande, c’est que le type "contenant" soit une monade.
+
+```scala
+type M[X] = Option[X] // ou encore List[X]
+def as[A](v: => A): WriterT[M, String, A] = Monad[({type f[x] = WriterT[M, String, x]})#f].point(v)
+
+def foo = for {
+  x <- as(1) :++> "J'ajoute 1"
+  y <- as(2) :++> ", J'ajoute 2"
+} yield x + y
+
+println(foo.run) // Some(3, J'ajoute 1, J'ajoute 2)
+```
+
+Voici maintenant un exemple un peu plus évolué (mais toujours inutile), incluant un soupçon de validation:
+
+```scala
+import WriterT._
+
+def isNull[A](x: A): WriterT[Option, String, A] = for {
+  a <- lift[Option, String, A](Option(x)) :++>> (r => "la référence est n'est pas null -> "[" + r + "]")
+} yield a
+
+println(isNull(1).run) // Some(1, la référence est n'est pas null -> [1])
+println(isNull(null).run) // None
+```
+
+La librairie Scalaz propose une implémentation plus robuste mais l’esprit est le même.
+
+Le principal problème c’est que le système d’inférence de Scala ne fonctionne pas très bien avec ce style (Monad Transformer). En conséquence, certaines combinaisons de monades se retrouvent visuellement polluées par des annotations de types, comme le montre cet exemple avec le type algébrique (\/ via EitherT), équivalent Scalaz d’Either mais en (beaucoup) mieux.
+
+```scala
+import scalaz._
+import std.string._
+import scala.math._
+
+object EitherTExample extends Application {
+  type Writer[+W, +A] = WriterT[Id, W, A]
+  type EitherTWriterAlias[W, A] = EitherT[({type f[x] = Writer[W, x]})#f, W, A]
+  type WriterAlias[A] = Writer[String, A]
+
+  def squareroot(x:Double): EitherTWriterAlias[String, Double] =
+    if (x < 0) EitherT.left[WriterAlias, String, Double]("Can't take squareroot of negative number")
+    else EitherT.right[WriterAlias, String, Double](sqrt(x))
+
+  def inverse(x:Double): EitherTWriterAlias[String, Double] =
+    if (x == 0) EitherT.left[WriterAlias, String, Double]("Can't take inverse of zero ")
+    else EitherT.right[WriterAlias, String, Double](1/x)
+
+  def resultat(x:Double) = for {
+    y <- squareroot(x).flatMap(i => EitherT[({type f[x] = Writer[String, x]})#f, String, Double](Writer[String, String \/ Double]("Squareroot ok", \/-(i))))
+    z <- inverse(y).flatMap(i => EitherT[({type f[x] = Writer[String, x]})#f, String, Double](Writer[String, String \/ Double]("Inverse ok", \/-(i))))
+  } yield z
+
+  println("0 : " + resultat(0.0).run.run</span>)
+  println("-1 : " + resultat(-1.0).run.run</span>)
+  println("4 : " + resultat(4).run.run</span>)
+}
+```
+
+Pour alléger cet inconvénient, J’ai ajouté dans Scalaz 7 deux nouvelles Typeclass MonadWriter (et ListenableMonadWriter). En utilisant les syntaxes spéciales associées, on peut avoir une version plus agréable à l’oeil de l’exemple précédent.
+
+```scala
+import scalaz._
+import std.string._
+import syntax.monadWriter._
+import scala.math._
+
+object EitherTExample extends Application {
+  implicit val monadWriter = EitherT.monadWriter[Writer, String, String]
+
+  def squareroot(x: Double) =
+    if (x < 0)
+      monadWriter.left[Double]("Can't take squareroot of negative number")
+    else
+      monadWriter.right[Double](sqrt(x))
+
+  def inverse(x: Double) =
+    if (x == 0)
+      monadWriter.left[Double]("Can't take inverse of zero")
+    else
+      monadWriter.right[Double](1 / x)
+
+  def resultat(x: Double) = for {
+    y <- squareroot(x) :++> "Squareroot ok"
+    z <- inverse(y)    :++> ", Inverse ok"
+  } yield z
+
+  println("0 : " + resultat(0.0).run.run) // (Squareroot ok,-\/(Can't take inverse of zero ))
+  println("-1 : " + resultat(-1.0).run.run) // (,-\/(Can't take squareroot of negative number))
+  println("4 : " + resultat(4).run.run) // (Squareroot ok, Inverse ok,\/-(0.5))
+}
+```

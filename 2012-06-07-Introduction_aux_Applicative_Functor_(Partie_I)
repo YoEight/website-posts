@@ -1,0 +1,246 @@
+Aujourd’hui j’aimerais parler des applicative functors. C’est une abstraction qui est souvent ignorée, certainement à cause de la notoriété (exagérée) des monades. Comme les monades, les applicatives functors permettent de séquencer des opérations.
+
+En ce sens, elles sont moins puissantes que les monades mais suffisantes dans de nombreux cas. Nous verrons pourquoi par la suite.
+
+Dans applicative functor, il y a functor ! Rappelons sa définition:
+
+```scala
+trait Functor[F[_]] {
+  def map[A, B](fa: F[A])(f: A => B): F[B]
+}
+```
+Cette abstraction est très utile car elle permet d’appliquer une fonction indépendamment du contexte F. Voici une implémentation simple avec le type Option
+
+```scala
+val optionFunctor = new Functor[Option]{
+  def map[A, B](fa: Option[A])(f: A => B): Option[B] = fa match {
+    case Some(a) => Some(f(a))
+    case None    => None
+  }
+}
+```
+
+Pour le type Option c’est très pratique car on a plus besoin de vérifier s’il y a une valeur ou non. L’abstraction Functor s’en occupe pour nous. La librairie standard de Scala fourni une méthode map qui permet d’avoir le même résultat. La seule différence vient du fait que la librairie n’a aucune représentation de la notion de Functor. Nous pouvons donc simplifier son implémentation comme ceci:
+
+```scala
+val optionFunctor = new Functor[Option]{
+  def map[A, B](fa: Option[A])(f: A => B): Option[B] = fa map f
+}
+```
+
+Passons maintenant à la définition d’Applicative functor:
+
+```scala
+trait Applicative[F[_]] {
+  def pure[A](v: => A): F[A]
+
+  def ap[A, B](ff: F[A => B], fa: F[A]): F[B]
+}
+```
+
+La méthode pure permet à partir d’une valeur simple A d’obtenir une valeur dans un contexte F (F[A])
+
+L’objectif de la méthode ap est d’extraire de ff une fonction (A => B) que l’on appliquera à la valeur de type A extraite de fa.
+
+Voici l’implémentation du type Option
+
+```scala
+val optionApplicative = new Applicative[Option]{
+
+  def pure[A](v: => A): Option[A] = Some(v)
+
+  def ap[A, B](ff: Option[A => B], fa: Option[A]): Option[B] = (ff, fa) match {
+    case (Some(f), Some(a)) => Some(f(a))
+    case _                  => None
+  }
+}
+```
+
+L’utilité de cette abstraction n’est peut-être pas évidente au premier coup d’œil mais ça viendra par la suite.
+
+Grâce à cette abstraction, nous pouvons définir quelques méthodes utiles comme celles-ci:
+
+```scala
+object Applicative {
+  def apply[F[_]](implicit F: Applicative[F]) = F
+
+  def liftA2[F[_]: Applicative, A, B, C](fa: F[A], fb: f[B])(f: (A, B) => C): F[C] = {
+    import Applicative[F]._
+
+    ap(ap(pure(f.curried), fa), fb)
+  }
+
+  def liftA3[F[_]: Applicative, A, B, C, D](fa: F[A], fb: f[B], fc: F[C])(f: (A, B, C) => D): F[D] = {
+    import Applicative[F]._
+
+     ap(ap(ap(pure(f.curried), fa), fb), fc)
+  }
+
+  // ... on peut continuer comme ça au moins jusqu'à vingt >:)
+}
+```
+
+La fonction liftA2 permet à partir de 2 valeurs F[A] et F[B], d’en extraire leurs contenus, de les passer en paramètre de la fonction f et de construire un nouveau contexte avec la valeur issue de l’application de f.
+
+La fonction liftA3 est identique à liftA2 sauf qu’elle s’applique sur 3 valeurs F[A], F[B] et F[C]
+
+Utilisons encore notre type Option avec un cas d’utilisation simple:
+
+```scala
+def addApplicativeOption(a: Option[Int], b: Option[Int], c: Option[Int]): Option[Int] =
+  liftA3(a, b, c)(_ + _ + _)
+```
+
+Si nous avions implémenté cette méthode monadiquement, elle serait ainsi:
+
+```scala
+def addMonadOption(a: Option[Int], b: Option[Int], c: Option[Int]): Option[Int] =
+  for {
+    x <- a
+    y <- b
+    z <- c
+  } yield x + y + z
+```
+
+Alors certains dirons "Oui mais… Nous pourrions également implémenter une fonction utilitaire pour avoir la même concision !". Ce qui est vrai mais malheureusement comme pour Functor, la librairie standard de Scala ne fourni pas de représentation pour la notion de monade. Donc on ne pourrait pas savoir si une valeur supporte une opération monadique. Le sucre syntaxique for n’est possible dans notre cas que si l’instance utilisée implémente les fonctions map et flatMap (ce qui ne rassemble pas toutes les conditions nécessaires pour être une monade !) Pour combler ce manque, nous utiliserons cette représentation:
+
+```scala
+trait Monad[F[_]]{
+  def point[A](v: => A): F[A]
+
+  def bind[A, B](fa: F[A])(f: A => F[B]): F[B]
+}
+```
+
+l’implémentation pour le type Option est directe
+
+```scala
+val optionMonad = new Monad[Option]{
+  def point[A](v: => A): Option[A] = Some(v)
+
+  def bind[A, B](fa: Option[A])(f: A => Option[B]): Option[B] = fa flatMap f
+}
+```
+
+Définissons maintenant les fonctions utilitaires équivalentes à celles de l’abstraction Applicative
+
+```scala
+object Monad {
+   def apply[F[_]](implicit F: Monad[F]) = F
+ }
+
+ def liftM2[F[_]: Monad , A, B, C](fa: F[A], fb: f[B])(f: (A, B) => C): F[C] = {
+   import Monad[F]._
+
+   bind(fa){
+     a =>
+       bind(fb){
+         b =>
+           point(f(a, b))
+       }
+   }
+ }
+
+ def liftM3[F[_]: Monad, A, B, C, D](fa: F[A], fb: f[B], fc: F[C])(f: (A, B, C) => D): F[D] = {
+   import Monad[F]._
+
+    bind(fa){
+      a =>
+        bind(fb){
+          b =>
+            bind(fc){
+             c =>
+              point(f(a, b, c))
+            }
+        }
+    }
+ }
+
+ // ... on peut continuer comme ça au moins jusqu'à vingt >:)
+```
+
+La version monadique est plus complexe car il y a plusieurs inclusions de fonctions contrairement à la version applicative.
+
+Ce qui revient pour notre méthode d’exemple:
+
+```scala
+def addMonadOption(a: Option[Int], b: Option[Int], c: Option[Int]): Option[Int] =
+  liftM3(a, b, c)(_ + _ + _)
+```
+
+liftA3 et liftM3 ne se limitent pas qu’aux options. Elles peuvent s’appliquer sur n’importe quel type qui implémente le type de classe Applicative (liftA2) ou Monad (liftM3). Nous pouvons écrire une version plus générique de nos méthodes addApplicativeOption et addMonadOption:
+
+```scala
+def addApplicative[F[_]: Applicative](a: F[Int], b: F[Int], c: F[Int]): F[Int] =
+  liftA3(a, b, c)(_ + _ + _)
+
+def addMonad[F[_]: Monad](a: F[Int], b: F[Int], c: F[Int]): F[Int] =
+  liftM3(a, b, c)(_ + _ + _)
+```
+
+Nous avons 2 abstractions différentes mais le résultat est identique. Quel(s) point(s) les différencient ?
+
+Principalement dans l’évaluation !
+
+Comparons l’implémentation des méthodes ap et bind pour le type Option:
+
+```scala
+def ap[A, B](ff: Option[A => B], fa: Option[A]): Option[B] = (ff, fa) match {
+  case (Some(f), Some(a)) => Some(f(a))
+  case (None   , Some(_)) => None
+  case (Some(_), None)    => None
+  case (None,    None)    => None
+}
+
+def bind[A, B](fa: Option[A])(f: A => Option[B]): Option[B] = fa match {
+  case Some(a) => f(a)
+  case None    => None
+}
+```
+
+Dans la méthode ap, on voit que même si ff est à None, on évalue le paramètre fa. Pour les Applicatives, un contexte précédant ne peut pas influencer l’évaluation du suivant !
+
+C’est pourquoi les monades sont plus puissantes car un contexte précédant peut influencer le suivant. Par exemple la méthode bind appliquée aux options, si fa est à None, on évalue pas le reste.
+
+Cette caractéristique des monades les rend moins applicables que les Applicatives. Donc si votre type ne forme pas une monade, il y a de fortes chances qu’il soit un applicative functor !
+
+D’autres conclusions peuvent être faites. Si votre type forme une monade, alors il forme obligatoirement un applicative functor ! La méthode suivante permet de construire un applicative functor pour F si et seulement si F est une monade:
+
+```scala
+def monadApplicativeFunctor[F[_]](implicit F: Monad[F]) = new Applicative[F]{
+  def pure[A](v: => A): F[A] = F.point(v)
+
+  def ap[A, B](ff: F[A => B], fa: F[A]): F[B] =
+    F.bind(ff){
+      f =>
+        F.bind(fa){
+          a =>
+            F.point(f(a))
+        }
+    }
+}
+```
+
+Si votre type forme un applicative functor, alors il forme obligatoirement un functor. Exemple:
+
+```scala
+def ApplicativeToFunctor[F[_]](implicit F: Applicative[F]) = new Functor[F]{
+  def map[A, B](fa: F[A])(f: A => B): F[B] = F.ap(F.pure(f), fa)
+}
+```
+
+Par implication, si votre type forme une monade, alors il forme obligatoirement un functor. Exemple
+
+```scala
+def monadFunctor[F[_]](implicit F: Monad[F]) = new Functor[F]{
+  def map[A, B](fa: F[A])(f: A => B): F[B] = F.bind(fa)(a => F.point(f(a)))
+}
+```
+
+En résumé:
+
+1. Les applicative functors permettent la composition et le sequencement de valeurs contextualisées comme les monades
+2. Ils sont moins puissants mais peuvent s’appliquer dans plus de situations que les monades
+3. Ils sont très efficaces lorsque l’on veut composer des contextes qui n’ont aucunes dépendances entre eux
+
+Nous verrons dans une prochaine publication une utilisation plus concrète des applicative functors. Nous verrons comme exemple la validation de données.
