@@ -1,0 +1,448 @@
+A long way from the first release of my Haskell EventStore driver. The current version (0.9.1.1) implements every EventStore feature (Competitive Consumer included) and is also available on [Stackage](https://www.stackage.org/nightly-2015-12-06/package/eventstore-0.9.1.1).
+
+ The initial design showed rapidly its limitation though. Adding new feature was tedious and the modularity of internal components almost nonexistent. A refactoring was necessary. Fortunately, that revamp didn't altered the public API. It breaks down to 3 points.
+
+1. Rewrite Subscription management.
+2. Rewrite Operation management.
+3. Separate driver logic from its execution.
+
+Rewrite Subscription management
+-------------------------------
+
+The main issue of the subscription management was clarity. The logic was mixed with a lot `IO` and some Functional Reactive Programming (FRP) magic tricks were involved. Here's the new layout:
+
+```
+Subscription
+├── Driver.hs
+├── Message.hs
+├── Model.hs
+└── Packages.hs
+```
+
+The subscription management is divided in 2 main parts: The `Model` and the `Driver`. `Message` module gathers all `Protobuf` messages related to subscriptions. `Packages` implements EventStore `Package` smart constructors.
+
+### Model
+
+In its core, subscription management is only about keeping some pieces of information updated.
+
+* Current subscription requests: The user asked for a subscription but the server hasn't responded yet.
+* Ongoing subscriptions: The user has already live subscriptions. If an event arrives, we should route it to the right subscriptions.
+
+The new design uses a state machine:
+
+```haskell
+newtype Model = Model (forall a. Request a -> a)
+```
+
+`Request` could be either a read or a write request.
+
+```haskell
+data Request a where
+    -- Read request.
+    Query :: Query a -> Request a
+    -- Write request.
+    Execute :: Action -> Request Model
+```
+
+Thanks to `GADTs`, we are able to enforce in the type system, that a write request will return a new `Model` instance (and then propagating state) while giving only requested value on read.
+
+```haskell
+data Query a where
+    -- Query a running 'Subscription'.
+    QuerySub :: UUID -> Query (Maybe Running)
+    -- Query a pending persistent action.
+    QueryAction :: UUID -> Query (Maybe PendingAction)
+```
+
+Basically, `Query` allows us to read runtime information of both running subscriptions and pending persistent action requests.
+
+```haskell
+data Action
+    = Connect UUID Connect
+      -- ^ Subscription connection.
+    | Confirmed Confirmed
+      -- ^ Subscription action confirmation.
+    | Unsubscribed UUID
+      -- ^ Subscription no longer exist.
+    | PersistAction Text Text UUID PersistAction
+      -- ^ Add a new persist action.
+```
+
+`Action`, on the other hand, updates subscription management internal `Model` state. It supports usual subscription operations.
+
+Note there isn't `IO` at this level. So when a `Connect` `Action` arrives, we do not connect to anything. We just reflect that operation on `Model` internal state. All we do is altering a `HashMap` that keeps track of every subscription operations.
+
+The whole `Model` state machine is represented by `modelHandle` function. The code may look dense but all it does is updating its `HashMap` accordingly.
+
+```haskell
+modelHandle :: State -> Request a -> a
+modelHandle s (Execute e) =
+    case e of
+        Connect u c ->
+            case c of
+                ConnectReg n tos ->
+                    let p      = PendingReg n tos
+                        nxt_ps = H.insert u p $ _stPending s
+                        nxt_s  = s { _stPending = nxt_ps } in
+                    Model $ modelHandle nxt_s
+                ConnectPersist g n b ->
+                    let p      = PendingPersist g n b
+                        nxt_ps = H.insert u p $ _stPending s
+                        nxt_s  = s { _stPending = nxt_ps } in
+                    Model $ modelHandle nxt_s
+        Confirmed c ->
+            case c of
+                ConfirmedConnection u tpe ->
+                    case tpe of
+                        RegularMeta lc le ->
+                            case H.lookup u $ _stPending s of
+                              Just (PendingReg n tos) ->
+                                  let r      = RunningReg u n tos lc le
+                                      nxt_rs = H.insert u r $ _stRunning s
+                                      nxt_s  = s { _stRunning = nxt_rs } in
+                                  Model $ modelHandle nxt_s
+                              _ -> Model $ modelHandle s
+                        PersistMeta sb lc le ->
+                            case H.lookup u $ _stPending s of
+                                Just (PendingPersist g n b) ->
+                                    let r      = RunningPersist u g n b sb lc le
+                                        nxt_rs = H.insert u r $ _stRunning s
+                                        nxt_s  = s { _stRunning = nxt_rs } in
+                                    Model $ modelHandle nxt_s
+                                _ -> Model $ modelHandle s
+                ConfirmedPersistAction u ->
+                    case H.lookup u $ _stAction s of
+                        Just (PendingAction{}) ->
+                            let nxt_as = H.delete u $ _stAction s
+                                nxt_s  = s { _stAction = nxt_as } in
+                            Model $ modelHandle nxt_s
+                        _ -> Model $ modelHandle s
+        Unsubscribed u ->
+            let nxt_ps = H.delete u $ _stRunning s
+                nxt_s  = s { _stRunning = nxt_ps } in
+            Model $ modelHandle nxt_s
+        PersistAction g n u t ->
+            let a      = PendingAction g n t
+                nxt_as = H.insert u a $ _stAction s
+                nxt_s  = s { _stAction = nxt_as } in
+            Model $ modelHandle nxt_s
+modelHandle s (Query q) =
+    case q of
+        QuerySub u    -> H.lookup u $ _stRunning s
+        QueryAction u -> H.lookup u $ _stAction s
+```
+
+Admittedly, I could use some `Lens` along with `State` monad but I want to keep my dependency tree as tight as possible. Moreover, there isn't much place where `lenses` brings more value in `eventstore` codebase.
+
+Subscription `Model` module implements a bunch of smart contructors in order to simplify its usage.
+
+```haskell
+-- | Retrieves a running 'Subscription'.
+querySubscription :: UUID -> Model -> Maybe Running
+querySubscription u (Model k) = k $ Query $ QuerySub u
+
+-- | Registers a persistent 'Subscription' request.
+connectPersist :: Text -> Text -> Int32 -> UUID -> Model -> Model
+connectPersist g n b u (Model k) =
+    k $ Execute $ Connect u (ConnectPersist g n b)
+```
+
+This new design is very testable. Because of its nature we cannot really use `quickcheck` here because there isn't much randomness in the data `Model` state-machine handles. However, we can pull great value from specification testing, using `hspec` for instance. No specification tests are implemented right now but those will land in near feature.
+
+### Driver
+
+`Model` state-machine is very typesafe. Unfortunately, we need to extract information from raw bytes comming from the server. That's what `Driver` is meant for. It uses a `Model` internally, deserializes to the right message depending on its internal command value and updates the `Model` accordingly. The `Driver` can also handle request coming from the user.
+
+Like `Model`, `Driver` is a state-machine that uses the same `Model`'s encoding. Nevertheless, a `Driver` can yield values in the process. Those values are universally quantified because the `Driver` has no use for them.
+
+```haskell
+newtype Driver r = Driver (forall a. In r a -> a)
+```
+
+Unlike `Model`, `Driver` has more complex write logic. When receiving a command, the `Driver` produces a `Package` and a new `Driver` instance. When a network `Package` is passed, it might not be related to a subscriptions operation, that's why the `Driver` may return nothing. `Abort` will terminate every ongoing operations which returns a list of `r` values.
+
+```haskell
+data In r a where
+    -- A command consists of receiving some parameters, updating the
+    -- 'Subscription' model accordingly and thus modifying driver internal
+    -- state.
+    Cmd :: Cmd r -> In r (Package, Driver r)
+    -- A 'Package' has been submitted to the 'Subscription' driver. If the
+    -- driver recognize that 'Package', it returns a final value and update
+    -- the driver internal state.
+    Pkg :: Package -> In r (Maybe (r, Driver r))
+    -- Aborts every pending action.
+    Abort :: In r [r]
+```
+
+`Driver` state-machine implementation is very similar to `Model` counterpart too. Yet it's more verbose.
+
+```haskell
+newDriver :: forall r. Settings -> Generator -> Driver r
+newDriver setts gen = Driver $ go (initState gen)
+  where
+    go :: forall a. State r -> In r a -> a
+    go st@State{..} (Pkg Package{..}) = do
+        elm <- H.lookup packageCorrelation _reg
+        case packageCmd of
+            0xC2 -> do
+                _   <- querySubscription packageCorrelation _model
+                msg <- maybeDecodeMessage packageData
+                let e   = getField $ streamResolvedEvent msg
+                    evt = newResolvedEventFromBuf e
+                    app = EventAppeared evt
+                    ConnectReg k _ _ = elm
+                return (k app, Driver $ go st)
+            …(Trimmed)…
+
+    go st@State{..} (Cmd cmd) =
+        case cmd of
+            ConnectReg _ s tos ->
+                let (u, nxt_g) = nextUUID _gen
+                    pkg        = createConnectRegularPackage setts u s tos
+                    nxt_m      = connectReg s tos u _model
+                    nxt_st     = st { _model = nxt_m
+                                    , _gen   = nxt_g
+                                    , _reg   = H.insert u cmd _reg } in
+                (pkg, Driver $ go nxt_st)
+            …(Trimmed)…
+
+    go st Abort = (H.elems $ _reg st) >>= abort
+```
+
+`Settings` is a global configuration object submitted by the user when a server connection is created. `Generator` is a pure `UUID` generator. Those are not essential in `Driver` design.
+
+So the `Driver` _drives_ its `Model` depending on its input. I could have made `Driver` and `Model` a single entity. It was a subjective call. I have nothing to back this choice. It just feels simpler. `Driver` declares smart constructors for `In` datatype. Higher level entities only deal with `Driver` when those want to operate on subscription. Because `Driver` doesn't do any `IO`, it very easy to integrate and test.
+
+Rewrite Operation management
+----------------------------
+
+My main issue with the previous operation design was composability. It wasn't possible to build a bigger operation based on small operations. Granted, `EventStore` operations are pretty simple. _BUT_, we have compounded operations if we look at catchup subscription for instance. A catchup subscription will keep creating `ReadForward` operations until it catches up the end of a stream. The new design allows us to directly express that kind of operation.
+
+Like `Model` and `Driver`, operation model is a state-machine too.
+
+```haskell
+newtype Model r = Model (Request r -> Maybe (Transition r))
+```
+
+Sorry for the name clash, I use qualified imports internally.
+
+```haskell
+data Request r
+    = forall a. New (Operation a) (Either OperationError a -> r)
+      -- ^ Register a new 'Operation'.
+    | Pkg Package
+      -- ^ Submit a package.
+    | Abort
+      -- ^ Aborts every pending operation.
+```
+
+Operation management is much complex than subscription. We can no longer know in a typesafe manner the output given an input. So basically, an operation model can register a new `Operation`, handle a network `Package` or abort a pending `Operation`.
+
+What an `Operation` is about ? Again it's a state-machine. However, unlike Subscription management, an `Operation` is a specification of what should be done. The operation `Model` is responsible for running that specification. A specification is made up of a finite set of instructions.
+
+```haskell
+-- | Main operation state machine instruction.
+data SM o a
+    = Return a
+      -- ^ Lifts a pure value into the intruction tree. Also marks the end of
+      --   an instruction tree.
+    | Yield o (SM o a)
+      -- ^ Emits an operation return value.
+    | FreshId (UUID -> SM o a)
+      -- ^ Asks for an unused 'UUID'.
+    | forall rq rp. (Encode rq, Decode rp) =>
+      SendPkg Word8 Word8 rq (rp -> SM o a)
+      -- ^ Send a request message given a command and an expected command.
+      --   response. It also carries a callback to call when response comes in.
+    | Failure (Maybe OperationError)
+      -- ^ Ends the instruction interpretation. If holds Nothing, the
+      --   interpretation should resume from the beginning. Otherwise it ends
+      --   by indicating what went wrong.
+```
+
+Basically, an `Operation` state machine is able to:
+* Yield a value. An `Operation` is seen as a stream of values. EventStore C# official driver doesn't see it that way. That's a personal call I find very practical and composable.
+* Ask for a fresh UUID. Every time we issue a command to the server with have to associate a correlation id represented as an UUID. It's used to discriminate the response afterwards. EventStore is very asynchronous, we might receive several different command responses before having the one we are waiting for.
+* Send a Protobuf message to the server. Every message sent to the server must have an appropriate response. This is well captured by the `SendPkg` data constructor.
+* Throw an error. We might receive a wrong response from the server or maybe the user submitted invalid values. When there isn't an error, it means `Operation` state-machine asked to restart it from the beginning.
+
+`SM` gathers the instruction set handled by the operation manager. Thanksfully, `SM` derives a `Monad` instance (the implementation is left as an exercise for the reader).
+
+Like other internal state machines, `Operation` module exports smart constructors.
+
+```haskell
+-- | Asks for a unused 'UUID'.
+freshId :: SM o UUID
+freshId = FreshId Return
+
+-- | Raises an 'OperationError'.
+failure :: OperationError -> SM o a
+failure e = Failure $ Just e
+
+-- | Asks to resume the interpretation from the beginning.
+retry :: SM o a
+retry = Failure Nothing
+
+-- | Sends a request to the server given a command request and response. It
+--   returns the expected deserialized message.
+send :: (Encode rq, Decode rp) => Word8 -> Word8 -> rq -> SM o rp
+send ci co rq = SendPkg ci co rq Return
+
+-- | Emits operation return value.
+yield :: o -> SM o ()
+yield o = Yield o (Return ())
+```
+
+`Operation` state-machine allows horizontal composition (vertical composition is provided by its `Monad` interface)
+
+```haskell
+-- | Replaces every emitted value, via 'yield' function by calling the given
+--   callback.
+foreach :: SM a x -> (a -> SM b x) -> SM b x
+foreach start k = go start
+  where
+    go (Return x)           = Return x
+    go (Yield a n)          = k a >> go n
+    go (FreshId ki)         = FreshId (go . ki)
+    go (SendPkg ci co p kp) = SendPkg ci co p (go . kp)
+    go (Failure e)          = Failure e
+```
+
+On every `Yield` instruction, we call the callback given as a parameter.
+
+`foreach` is very similar to `>>=`. Let's have a look on those signatures:
+
+```haskell
+foreach :: SM a x -> (a -> SM b x) -> SM b x
+
+(>>=) :: SM x a -> (a -> SM x b) -> SM x b
+```
+
+`foreach` binds over the first `SM` parameter while `>>=` binds over the last one. Thanks to `foreach` we are able to map over the values emitted by an `Operation` state-machine.
+
+```haskell
+-- | Maps every emitted value, via 'yield', using given function.
+mapOp :: (a -> b) -> SM a () -> SM b ()
+mapOp k sm = foreach sm (yield . k)
+```
+
+Why would we need this ? We have compounded features like `Catchup` subscription. `Cactchup` subscription will send several `ReadForward` requests before issuing a subscription request. Using `foreach` is a nice way to implement it.
+
+`SM` is very similar to `pipes` or `machines` internal data structure. I'd use `pipes` but again, it'd be the only place where it'd be useful. So no need to increase my dependency graph.
+
+### Interpretation
+
+An `Operation`, through `SM` monad describes what an operation should do. But, it needs an implementation. That's what `Operation` model is about.
+
+`runOperation` is called when a new `Operation` has been added.
+
+```haskell
+runOperation :: Settings
+             -> (Either OperationError a -> r)
+             -> Operation a
+             -> SM a ()
+             -> State r
+             -> Transition r
+runOperation setts cb op start init_st = go init_st start
+  where
+    go st (Return _)  = Await $ Model $ handle setts st
+    go st (Yield a n) = Produce (cb $ Right a) (go st n)
+    go st (FreshId k) =
+        let (new_id, nxt_gen) = nextUUID $ _gen st
+            nxt_st            = st { _gen = nxt_gen } in
+        go nxt_st $ k new_id
+    go st (SendPkg ci co rq k) =
+        let (new_uuid, nxt_gen) = nextUUID $ _gen st
+            pkg = Package
+                  { packageCmd         = ci
+                  , packageCorrelation = new_uuid
+                  , packageData        = runPut $ encodeMessage rq
+                  , packageCred        = s_credentials setts
+                  }
+            elm    = Elem op co k cb
+            ps     = H.insert new_uuid elm $ _pending st
+            nxt_st = st { _pending = ps
+                        , _gen     = nxt_gen
+                        } in
+        Transmit pkg (Await $ Model $ handle setts nxt_st)
+    go st (Failure m) =
+        case m of
+            Just e -> Produce (cb $ Left e) (Await $ Model $ handle setts st)
+            _      -> runOperation setts cb op op st
+```
+
+* On `Return`: `runOperation` stops its recursion. It triggers the need of more input from upper level.
+* On `Yield`: Emits a new value and the computation of next operation `Model` state transition.
+* On `FreshId`: Produces a new `UUID` then resumes the interpretation.
+* On `SendPkg`: Prepares a `Package` based on a serialized message. The interpretation is suspended. It stores the continuation in a `Map` (associated to an UUID). When we will receive a response from the server, it will lookup the continuation and resume the interpretation from there.
+* On `Failure`, whether we have an error or not, it either restarts the interpretation from the beginning or reports an error occurred.
+
+Being able to suspend the interpretation of an `Operation` is very useful. It makes `Operation` management simpler because it's seen as a unit of computation. Everything is done without involving `IO` so far.
+
+`runPackage` showcases how a continuation is resumed when we receive a `Package` from the server.
+
+```haskell
+runPackage :: Settings -> State r -> Package -> Maybe (Transition r)
+runPackage setts st Package{..} = do
+    Elem op resp_cmd cont cb <- H.lookup packageCorrelation $ _pending st
+    let nxt_ps = H.delete packageCorrelation $ _pending st
+        nxt_st = st { _pending = nxt_ps }
+    if resp_cmd /= packageCmd
+        then
+            let r = cb $ Left $ InvalidServerResponse resp_cmd packageCmd in
+            return $ Produce r (Await $ Model $ handle setts nxt_st)
+        else
+            case runGet decodeMessage packageData of
+                Left e  ->
+                    let r = cb $ Left $ ProtobufDecodingError e in
+                    return $ Produce r (Await $ Model $ handle setts nxt_st)
+                Right m -> return $ runOperation setts cb op (cont m) nxt_st
+```
+
+We retrieve a previous `Operation` from the pending operations `Map` (given a correlation id), deserialize to the expected message, pass that message to the continuation and resume interpretation.
+
+We saw that an `Operation` is a specification run by the operation manager. The operation manager updates its state during an `Operation` interpretation.
+
+Separate logic from execution
+-----------------------------
+
+Subscription and operation managers form the EventStore driver logic. Those are part of the `Processor` module. `Processor` is only a router that leads a command or a `Package` to the right manager, that's all.
+
+The driver logic can't do anything on its own. It needs to read from and write to a network socket in order to be useful. It needs to perform several tasks at the same time in order to be useful for the user. That's what the execution model is about.
+
+Currently, this EventStore driver has only one execution model located in the `Production` module. It amims for multithreaded, fault tolerant execution model. It's very simple and is composed of 4 threads:
+
+* The reader: Reads `Package` from the socket.
+* The writer: Writes `Package` to the socket.
+* The runner: Executes `IO` actions related to EventStore operation lifecycle (creation, completion, notification,…).
+* The manager: Manages the threads detailed above and holds the driver logic state (a.k.a `Processor`).
+
+`Production` execution model doesn't try to do clever things. At the first error, it crashes and restarts. Of course its behaviors can be changed by the user through `Settings`.
+
+Manager thread has 3 transitions.
+
+### Bootstrap
+
+Spawns a thread for reader, writer and runner. If one of those threads dies, the manager will be notified.
+
+### Cruising
+
+Reads messages from the main channel. That channel is used by the user (not directly of course), the reader and writer threads. Either on an user command or a new `Package` from the server, it will update the `Processor` accordingly. However when a thread is reported dead, the manager thread dies too (it re-throws the same exception responsible of the former thread's death). When the user asked the driver to shutdown, the manager thread just ends.
+
+### Closing
+
+This transition is always called whether the manager died normally or not. Here's what happening:
+
+1. Kill both reader and writer threads.
+2. Delete all `Package`s that were about to be sent.
+3. Handle all `Package`s we already got from the server. The `Processor` is updated accordingly for all of them. User commands remain untouched in the channel.
+4. Close the connection to the server.
+5. Abort all ongoing operations (subscriptions included).
+6. Wait the runner thread to complete its job list.
+7. Kill the runner thread.
+
+Now depending on the situation, the manager thread will be re-spawned or remain dead / closed. If it's re-spawned, it will start from the `bootstrap` transition.
+
+
+It's too soon to determine if the new design is good. However, separating the logic from the execution model is very effective when you want to reduce coupling among your software components. I can improve the execution model reliability while being sure the logic will not be impacted. Likewise, I can change the logic without worrying about how it will be executed. Of course, separating the logic from the execution model isn't only doable in Haskell. Nonetheless, because Haskell tracks side-effects in its type system, it's much easier to implement it (or harder to cheat).
