@@ -1,0 +1,284 @@
+CQRS stands for Command Query Responsibility Segregation, which can be naively described as separating the read and write models. Recently [www.corecursion.net](http://www.corecursion.net) got its domain model redesigned. For the record, [www.corecursion.net](http://www.corecursion.net) is eventsourced. It means, the website represents its data as a stream of events where each event represents a fact during the application execution.
+
+Here're some 'fact' examples:
+
+* A post has been created.
+* Post title has changed.
+* An author has been added.
+
+Thanks to those 'facts', we are able to build an application state by reading a stream from the beginning to the end.
+
+[www.corecursion.net](http://www.corecursion.net) has 4 streams so far:
+
+* `posts`: Holds post lifecycle facts like post creation, deletion or publication.
+* `post:{post's uuid}`: Holds a post content modification like its title, summary, tags or content have been updated.
+* `authors`: Holds authors facts. Currently there's only user creation.
+* `stats-{post's uuid}`: Holds a post statistics like 'a visitor viewed this article'.
+
+So if we want to know how many posts the website has, we just have to read `posts` stream entirely. If we want to know the final shape of a post, we need to read `post:{that post uuid}` fully.
+
+Of course, if we have to do this everytime we need some post information, it will be pretty slow. Usually, reading a stream entirely from the beginning is done when the application starts up. We fold left a stream (given an initial state) and got a final state when we reached the end of it.
+
+In Haskell, that's a common pattern represented by `foldl`:
+
+```haskell
+foldl :: Foldable t => (b -> a -> b) -> b -> t a -> b
+```
+
+A stream is kind of `Foldable`, yet it doesn't have a proper `Foldable` instance. However, we can write a function (`streamFold`) that captures `foldl` intent.
+
+```haskell
+-- | Left folds a stream of events from the beginning given a state seed.
+streamFold :: FromJSON a
+           => Connection                        -- EventStore connection.
+           -> Text                              -- Stream name.
+           -> (s -> a -> Maybe UTCTime -> IO s) -- Iteratee function.
+           -> s                                 -- Initial state.
+           -> IO s
+```
+
+Very similar to `foldl` given environment values (EventStore connection and stream's name). The implementation is very EventStore specific, so not very important:
+
+```haskell
+streamFold :: FromJSON a
+           => Connection
+           -> Text
+           -> (s -> a -> Maybe UTCTime -> IO s)
+           -> s
+           -> IO s
+streamFold conn stream k seed = go 0 seed
+  where
+    go start s = do
+        act <- readStreamEventsForward conn stream start 500 False
+        res <- wait act
+        case res of
+            ReadSuccess sl -> do
+                let foldF ss revt =
+                        let action = do
+                                 let evt = resolvedEventOriginal revt
+                                 meta <- recordedEventMetadata evt
+                                 e    <- recordedEventDataAsJson evt
+                                 return (parseTime meta, e) in
+                        case action of
+                            Nothing        -> return ss
+                            Just (date, e) -> k ss e date
+                    next = sliceNext sl
+                newS <- foldM foldF s $ sliceEvents sl
+                if sliceEOS sl
+                    then return newS
+                    else go next newS
+            ReadNoStream -> return s
+            e            -> fail $ "wrong slice read result" ++ show e
+```
+
+So now, we have our main event source framework: streams and `streamFold`. That's all we need.
+
+## Use case: Posts
+
+#### Write model
+
+Posts domain models are described by both `posts` and `post:{post uuid}` streams. `posts` stream holds post lifecycle facts represented by `ContentEvent` datatype.
+
+```haskell
+data ContentEvent
+    = PostCreated !PostId
+      -- ^ Indicates a new post was created
+    | PostPublished !PostId
+      -- ^ Indicates a post was published.
+    | PostDeleted !PostId
+      -- ^ Indicates a post was deleted.
+    | PostUnpublished !PostId
+      -- ^ Indicates a published post was unpublished.
+    | AboutUpdated !Text
+      -- ^ Indicates about page was updated.
+```
+Posts state is represented by `Content` datatype:
+
+```haskell
+data Content =
+    Content
+    { _cPosts     :: !(H.HashMap PostId Post)
+    , _cPubs      :: !(I.IntMap PublishedPost)
+    , _cTagged    :: !(S.SetMap Text Int)
+    , _cAboutText :: !Text
+    , _cAbout     :: !Html
+    }
+```
+
+Nothing fancy, we keep tracks of some useful associations:
+
+* `_cPosts`: Holds all posts.
+* `_cPubs`: Holds only published posts.
+* `_cTagged`: Groups published posts by tags.
+* `_cAboutText`: Markdown formatted about page.
+* `_cAbout`: Rendered about page.
+
+We can construct an up-to-date `Content` by left folding `posts` stream:
+
+```haskell
+streamFold conn "posts" content emptyContent
+```
+`content` has the following signature:
+
+```haskell
+content :: Content -> ContentEvent -> Maybe UTCTime -> IO Content
+```
+
+`Maybe UTCTime` here represents the date when that event was issued. Not every event handler needs it.
+
+```haskell
+ content s (PostCreated postid) _ = do
+     p <- buildPost conn postid
+     return s { _cPosts = H.insert postid p $ _cPosts s }
+```
+
+On `PostCreated`, we rebuild a `Post` state and associate it with its `PostId`.
+
+```haskell
+-- | A 'Post' that has been tagged as published by an author. Meaning its content, in
+--   Markdown format has been rendered to HTML.
+data PublishedPost =
+    PublishedPost
+    { postDate :: !UTCTime
+    , _post    :: !Post
+    , postLink :: !Text -- permanent link.
+    , postHtml :: !Html
+    }
+
+content s (PostPublished postid) (Just date) = do
+    action <- forM (H.lookup postid $ _cPosts s) $ \p -> do
+        sp <- snapshot p
+        let tags  = postTags sp
+            lnk   = permanentLink sp
+            html  = markdownToHtml $ postContent sp
+            ppost = PublishedPost date p (permanentLink sp) html
+            pid   = hash lnk
+            ts    = foldl (\m t -> S.insert t pid m) (_cTagged s) tags
+            s'    = s { _cPubs   = I.insert pid ppost $ _cPubs s
+                      , _cTagged = ts
+                      }
+        return s'
+    return $ fromMaybe s action
+```
+On `PostPublished` event, we retrieve the `Post` associated to the given `PostId`. We instanciate a `PublishedPost` record (rendering HTML, generating permanent link,…) then insert it into published posts map. We also reference that post in tags map.
+
+```haskell
+content s (PostDeleted postid) _ =
+    return s { _cPosts = H.delete postid $ _cPosts s }
+```
+
+On `PostDeleted`, we delete the `Post` associated to the given `PostId`.
+
+```haskell
+content s (PostUnpublished postid) _ = do
+    res <- forM (H.lookup postid $ _cPosts s) $ \p -> do
+        sp <- snapshot p
+        let lnk = permanentLink sp
+            pid = hash lnk
+        return s { _cPubs = I.delete pid $ _cPubs s }
+    return $ fromMaybe s res
+```
+
+On `PostUnpublished`, we lookup the `Post` associated to the given `PostId`. We use its permanent link hash to delete it from the published posts map.
+
+```haskell
+content s (AboutUpdated c) _ =
+    return s { _cAbout     = markdownToHtml c
+             , _cAboutText = c
+             }
+```
+
+On `AboutUpdated`, we render about page with supplied markdown text. Then we store the generated HTML and the markdown text.
+
+At the end of `streamFold`, we have a fully initialized `Content` data structure. It will be used to create our write model. That write model is represented by `Posts` data type:
+
+```haskell
+data Posts =
+    Posts
+    { _conn   :: Connection
+    , _posts  :: TVar (H.HashMap PostId Post)
+    , _pubs   :: TVar (I.IntMap PublishedPost)
+    , _tagged :: TVar (S.SetMap Text Int)
+    , _about  :: TVar About
+    }
+```
+
+`Posts` is basically `Content` with all its members being wrapped into `TVar`s. For the unaware, `TVar` is a variable reference in Software Transactional Memory (STM) context. It allows us to update or read thread-safely a piece of information shared among several threads.
+
+Now, we have everything we need to implement `buildPosts`, a function given an EventStore connection, will reconstruct our `Posts` write model, our application state in a sense.
+
+```haskell
+buildPosts :: Connection -> IO Posts
+buildPosts conn = do
+    c     <- streamFold conn "posts" content emptyContent
+    psVar <- newTVarIO $ _cPosts c
+    ppVar <- newTVarIO $ _cPubs c
+    aVar  <- newTVarIO $ About (_cAboutText c) (_cAbout c)
+    tVar  <- newTVarIO $ _cTagged c
+
+    return Posts
+           { _conn   = conn
+           , _posts  = psVar
+           , _pubs   = ppVar
+           , _about  = aVar
+           , _tagged = tVar
+           }
+```
+
+Earlier, on `PostCreated` event, we build a `Post` given an `PostId`. `buildPost` is implemented exactly like `buildPosts`:
+
+```haskell
+buildPost :: Connection -> PostId -> IO Post
+buildPost conn postid = do
+    s   <- streamFold conn (postStream postid) post emptyPostSnapshot
+    var <- newTVarIO s
+    return $ Post conn postid var
+  where
+    post p (PostContentUpdated c) _ =
+        return p { postContent = c }
+    post p (PostTitleUpdated t) _ =
+        return p { postTitle = t }
+    post p (PostTagsUpdated ts) _ =
+        return p { postTags = ts }
+    post p (PostSummaryUpdated s) _ =
+        return p { postSummary = s }
+```
+
+`Posts` and `Post` are called *Aggregates*. In event sourcing parlance, an aggregate is assigned to only one stream. A stream should not be shared by more than one aggregate. Aggregates are the only entities able to add new events to their stream. Only an *aggregate* can handle command. A command is an intent like `UpdatePostTitle`. An event, on the other hand, is a fact like `PostTitleUpdated`. `Posts` has several commands. When dealing with a command, an *aggregate* usually performs effectful computations. Let's have a look on a simple command, namely `createPost`.
+
+```haskell
+createPost :: Posts -> Text -> Text -> Text -> [Text] -> IO ()
+createPost Posts{..} title content summary tags = do
+    let cs = [ SetPostTitle title
+             , SetPostContent content
+             , SetPostSummary summary
+             , SetPostTags tags
+             ]
+
+    p <- newPost _conn cs
+    let create_evt = PostCreated $ postId p
+        saved_evt  = createEvent "post-created" Nothing $ withJson create_evt
+
+    writeNewPost <- sendEvent _conn "posts" anyVersion saved_evt
+    atomically $ do
+        _ <- waitSTM writeNewPost
+        modifyTVar' _posts (H.insert (postId p) p)
+```
+
+In `createPost`, when we've created a new `Post`, once the event `PostCreated` has been successfully saved, we update `Post` map accordingly (here, adding that new `Post`).
+
+### Read model
+
+Because my website is very simple, I don't need to differentiate my read and write models. However, that something you _SHOULD NEVER_ do if you decide to implement a CQRS design. Because, decoupling takes a lot of time, in particular if your domain is complex. Very often when you introduce someone to CQRS design, she/he might ask:
+
+*What if I want to do complex queries (like SQL) ?*
+
+It might sound weird but CQRS doesn't enforce you to use only one database for your app ! That advice isn't specific to CQRS neither. CQRS isn't specific to event sourcing. However, because we use event sourcing to store our data, we better implement a CQRS design !
+
+Back to original question, how I query my application state ? Very simple, use a SQL database ! Something I implemented before is to use an in-memory SQLite database for my read model. Let's consider `Posts` for instance. When reading `posts` stream, I can insert in a table named `posts` a line on very `PostCreated` event. Each line will contains post's information like its title, summary, tags, content,…etc. I will be able to query any type of information from there. For example, retrieving all posts with `haskell` and `eventstore` as tags. We can really do whatever we want, with no change on write model side.
+
+*What if some changes happened after I built my read model ? My read will be out of sync !*
+
+Well, if you use EventStore, you could use a subscription, in order to be notified on changes made to streams. That way, you could `UPDATE` a line accordingly. `PostTitleUpdated` event ? Alright, I update that post line. Simple ! If a different part of your application needs a different projections, you can also create a new read model specific that situation.
+
+Another benefit from decoupling read from write model, you can dedicate more resources where you really need it. From experience, you usually need more resources on read rather than write, because you *should* read way more often than you write. Different situation, if you have trouble with your write model, which doesn't need to be on the same machine, you can still run a degraded mode.
