@@ -1,0 +1,333 @@
+Over the course of 2016, I have implemented many eventsource based applications,
+in particular in Haskell. Now, you've probably heard about an old adage in
+eventsourcing circles that's *"don't ever use a framework to implement your
+eventsourced application"*. Personally, I agree with it.
+
+However, nobody would disagree (I think) that bootstrapping an eventsourced
+application is pretty boring. There is a good amount of boilerplate which
+cannot be generated.
+
+  * Declare the events related to the domain.
+  * Implement event serialization and deserialization.
+  * Implement related aggregate(s) logic.
+  * Bind aggregate(s) to event store backend.
+
+This is obviously not an exhaustive list but it should sound familiar to a lot
+of people. Where I think some work can be done is, any interaction with the
+event store backend and serialization / deserialization events process.
+
+# Meet the `Store` typeclass
+
+```haskell
+-- | Main event store abstraction. It exposes essential features expected from
+--   an event store.
+class Store store where
+  -- | Appends a batch of events at the end of a stream.
+  appendEvents :: (EncodeEvent a, MonadIO m)
+               => store
+               -> StreamName
+               -> ExpectedVersion
+               -> [a]
+               -> m (Async EventNumber)
+
+  -- | Appends a batch of events at the end of a stream.
+  readBatch :: MonadIO m
+            => store
+            -> StreamName
+            -> Batch
+            -> m (Async (ReadStatus Slice))
+
+  -- | Subscribes to given stream.
+  subscribe :: MonadIO m => store -> StreamName -> m Subscription
+```
+The idea is to expose a read operation (`readBatch`), write operation (`appendEvents`) and
+also a mean to be notified when some events have been added to a stream.
+
+If you know about a package I maintained, [eventstore][], which is a
+TCP client for the [GetEventstore][] database, those signatures may look
+familiar to you. While not being entirely a full copy of some of my
+[eventstore][] exposed API, I think it captures the core nature of
+an eventsourced interface.
+
+### Write to a stream
+
+Writing to a stream is pretty straightforward. All you need is a stream name
+, a batch of values that can be encoded to an `Event` (through `EncodeEvent`
+typeclass) and a mean to assure data consistency (`ExpectedVersion`). In a
+eventsource setting, the order of events in a stream matters. That's what
+`ExpectedVersion` is about. An `Event` is defined like this:
+
+```haskell
+-- | Encapsulates an event which is about to be saved.
+data Event =
+  Event { eventType :: EventType
+        , eventId :: EventId
+        , eventPayload :: Data
+        , eventMetadata :: Maybe Properties
+        } deriving Show
+```
+With `Event`, I tried to propose a lean and flexible representation suitable for
+(in my opinion) any event store backend. It's an intermediate event
+representation. An `Event` is comprised of:
+* A type: represented by `EventType` which is basically a `newtype` with an
+`IsString` instance for convenience.
+* An Id: represented by `EventId` which is also a `newtype` over an `UUID`.
+* A payload: The event's data represented by `Data` type. Currently, it's
+either a raw `ByteString` or a `JSON` representation.
+* Some metadata: It's represented by `Properties` type. `Properties` is simply
+a map where both the key and value are `Text`. By experience, metadata are always
+represented as a collection of key-value pairs.
+
+`EncodeEvent` typeclass allows to create an `Event` from a meaningful event
+representation:
+
+```haskell
+-- | Encodes a data object into an 'Event'. 'encodeEvent' get passed an
+--   'EventId' in a case where a fresh id is needed.
+class EncodeEvent a where
+  encodeEvent :: a -> State Event ()
+```
+
+One could wonder why we use a stateful computation. Simple, only for convenience.
+We're able to initialize an `Event` with default values (like its `EventId`) and
+only overwrite what we need. It also feels very imperative and allow conditional
+construct with pleasing syntax. If striving for aesthetic, one could also use
+`lenses` operators. Initially, I chose to go with a `Monoid` syntax (through
+`Endo`) but complex construction revealed being ugly to write.
+
+```haskell
+-- | The purpose of 'ExpectedVersion' is to make sure a certain stream state is
+--   at an expected point in order to carry out a write.
+data ExpectedVersion
+  = AnyVersion
+    -- Stream is a any given state.
+  | NoStream
+    -- Stream shouldn't exist.
+  | StreamExists
+    -- Stream should exist.
+  | ExactVersion EventNumber
+    -- Stream should be at givent event number.
+  deriving Show
+
+```
+`ExpectedVersion` is totally stolen from [GetEventstore][] and was really useful for
+me. For instance you might want an event like `ItemPurchased` be appended only
+if only an event `AccountCreated` exists already or maybe a stream `account:joe`
+exists.
+
+Writing to a stream is asynchronous in nature. That's why `appendEvents` returns
+a value in an `Async` from [async][] package. When the write has been carried
+out successfully, an `EventNumber` will be returned. It informs you the next
+`EventNumber` that would be assigned to the next event saved by the store.
+
+### Read from the stream
+
+Reading from a stream needs very few things. A stream name, a starting point in
+a stream and a batch size (both of these are represented by `Batch` value). I
+believe paging should be done by the user. Because as is, it's a very
+atomic operation allowing to implement higher level abstractions on top of it.
+An example of higher level stream reading technique is left-folding from the
+beginning of a stream to its end.
+
+`SavedEvent` is introduced, it's a product of an `EventNumber` with an `Event`
+data structure:
+
+```haskell
+-- | Represents an event that's saved into the event store.
+data SavedEvent =
+  SavedEvent { eventNumber :: EventNumber
+             , savedEvent :: Event
+             } deriving Show
+```
+
+By doing this, we are able to track each `EventNumber` of every event read when
+loading an aggregate. This information reveals to be useful if `ExactVersion` is
+used when performing a write.
+
+It's possible to load a meaningful event representation from an `Event` value with
+the `DecodeEvent` typeclass:
+
+```haskell
+-- | Decodes an 'Event' into a data object.
+class DecodeEvent a where
+  decodeEvent :: Event -> Either Text a
+```
+
+Nothing fancy here. If we can't parse, we raise a user defined textual error. I
+didn't find a more compelling representation for error yet. It's good enough for
+now.
+
+Based upon `readBatch` we're able to implement higher level of iteration pattern,
+like left-folding or stateful iterator. `readBatch` returns `ReadStatus Slice`.
+
+`ReadStatus` represents the state of your read attempt and tries to give the best
+feedback it can:
+
+```haskell
+-- | Statuses you can get on every read attempt.
+data ReadStatus a
+  = ReadSuccess a
+  | ReadFailure ReadFailure
+  deriving Show
+
+-- | Represents the different kind of failure you can get when reading.
+data ReadFailure
+  = StreamNotFound
+  | ReadError (Maybe Text)
+  | AccessDenied
+  deriving Show
+```
+
+If things went well, you should receive a `Slice` data structure:
+
+```haskell
+-- | Represents batch of events read from a store.
+data Slice =
+  Slice { sliceEvents :: [SavedEvent]
+        , sliceEndOfStream :: Bool
+        , sliceNextEventNumber :: EventNumber
+        } deriving Show
+```
+
+`Slice` permits to implements proper paging through its properties:
+
+* A list of read events: `sliceEvents`
+* A flag telling you if you reach the end of the stream: `sliceEndOfStream`
+* If you want to read more events and you didn't reach end of stream, an
+`EventNumber` is passed telling from where you should start for your next read:
+`sliceNextEventNumber`.
+
+### Keep up with a stream's state
+
+This is particularly useful to be notified that a stream has received new changes
+when building a read model in your application. `Store` typeclass captures that
+need with `subscribe` function. That's another nice feature [GetEventstore][]
+database offers that I think should be exposed by default in a store abstraction.
+However [GetEventstore][] comes with different subscription models but `Store` doesn't
+enforce any. It's up to the `Store` implementors to choose whatever model they
+want.
+
+```haskell
+-- | A subscription allows to be notified on every change occuring on a stream.
+data Subscription =
+  Subscription { subscriptionId :: SubscriptionId
+
+               , nextEvent :: forall m. MonadIO m
+                           => m (Either SomeException SavedEvent)
+               }
+```
+
+The most interesting function of the `Subscription` record is `nextEvent`. It
+could either return an `Exception` or a `SavedEvent`. The exception part is
+existential because I let the store implementor rolling one own exception type(s).
+If everything went well, a `savedEvent` is expected.
+
+Fundamentally, `nextEvent` is expected to block until an event arrives. But
+nothing is forced upon the implementor. Very useful functions can be implemented
+just by sticking to the `Subscription` pattern.
+
+```haskell
+-- | Folds over every event coming from the subscription until the end of the
+--   universe, unless an 'Exception' raises from the subscription.
+--   'SomeException' is used because we let the underlying subscription model
+--   exposed its own 'Exception'. If the callback that handles incoming events
+--   throws an exception, it will not be catch by the error callback.
+foldSub :: (DecodeEvent a, MonadIO m)
+        => Subscription
+        -> (a -> m ())
+        -> (SomeException -> m ())
+        -> m ()
+
+-- | Asynchronous version of 'foldSub'.
+foldSubAsync :: DecodeEvent a
+             => Subscription
+             -> (a -> IO ())
+             -> (SomeException -> IO ())
+             -> IO (Async ())
+```
+
+### Why choosing to encode `Store` as a typeclass instead of a regular record ?
+
+I never been a fan of typeclasses that aren't constrained by laws. Mainly because
+typeclasses should be easy to reason about and also because they are not meant to
+be the go to solution when you want function overloading in Haskell. At first,
+`Store` abstraction was like:
+
+```haskell
+data Store
+  { appendEvents :: forall a m. (EncodeEvent a, MonadIO m)
+                 => StreamName
+                 -> ExpectedVersion
+                 -> [a]
+                 -> m (Async EventNumber)
+
+  , readBatch :: forall m. MonadIO m
+              => StreamName
+              -> Batch
+              -> m (Async (ReadStatus Slice))
+
+  , subscribe :: forall m. MonadIO m => StreamName -> m Subscription
+  }
+```
+
+It's a classic OOP interface or abstract class encoding in mainstream languages.
+The issue arises when you happen to want a specific feature from your eventstore
+backend but still want to use the simplified `Store` API. Using a
+typeclass keeps the type information of the event store client whereas using the OOP
+encoding makes it existential (existential quantification) with no possibility of
+downcasting. So picking the typeclass encoding was the pragmatic choice (I hate
+to call it like this) because it's easier to use in this configuration.
+
+### Why exposing `Store` functions as `MonadIO` actions ?
+
+I could have simply used `IO` result type instead. It would have lowered the
+barrier of entry for beginners. The thing is 99% of the time, an Haskell application
+implements its own `Monad` stack. By using `MonadIO`, it alleviates the burden
+of writing `liftIO` everywhere in your code.
+
+Even if we could agree that `Monad` transformers aren't perfect when it comes
+to compose effects, those are good enough. With `MonadIO` constraint, it basically
+says: "I don't care about your monad as long as I can perform IO action".
+
+### Benefits of a `Store` abstraction
+
+Having a common `Store` interface in Haskell isn't a bad idea like it could be in
+languages with lower abstraction level. We can be generic about the type of
+effects we want to perform, resulting to better code composition across the
+entire application.
+
+It also simplifies a lot testing. Nothing prevents you from mocking a `Store`
+abstraction. You could verify afterwards that everything's been saved accordingly.
+
+By having a common `Store` abstraction, we could agree on how an implementation
+should behave. For instance, exposing a `HUnit` or `HSpec` module that define
+every check a store implementation must comply with.
+
+# Introducing `eventsource` family project
+
+During Christmas holidays, I tried to work on the foundation described above.
+I'm glad to start a new package family named [eventsource][]. As I speak, it's
+composed of 4 packages:
+* eventsource-api: Provides the `Store` abstraction described above along with
+higher order functions and common types used.
+* eventsource-store-specs: Provides specification a `Store` implementation
+should comply with. It's meant to be imported in a test-suite of every `Store`
+implementation.
+* eventsource-stub-store: Provides an in-memory `Store` for testing purpose. It
+allows stream introspection and complex testing strategies.
+* eventsource-geteventstore-store: Provides a [GetEventstore][] `Store`
+implementation, based on my [eventstore][] client.
+
+The code is in a release state but isn't pushed onto Hackage yet. Some details
+need to be carried out like dependencies version bounds. The public API
+documentation is pretty complete. `eventsource-store-specs` may need more
+test use cases. Those will arrive has the project goes forward. As always,
+everybody is invited to contribute. If you have any question or want to challenge what
+I said, please reach out on Twitter or for more complex interaction, consider
+this open [issue][] on Github related to that blog post.
+
+[eventstore]: https://github.com/YoEight/eventstore
+[GetEventstore]: https://geteventstore.com
+[async]: https://hackage.haskell.org/package/async
+[eventsource]: https://github.com/YoEight/eventsource-api
+[issue]: https://github.com/YoEight/website-posts/issues/1
