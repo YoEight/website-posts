@@ -42,7 +42,7 @@ stumble upon this issue a single time but it's certainly worthwhile to have.
 implement every log statement as a data structure. One could implement a logging system just by
 submitting a function of `Log -> IO ()` to the [client][] settings. It's very flexible because
 you can pattern match an `ErrorMessage` or `InfoMessage` and implement a tailored textual
-representation. The C# chose a more classic approach. At the end of the day, I want it to be
+representation. The C# client chose a more classic approach. At the end of the day, I want it to be
 useful so I may switch back to a classical approach too if my first attempt revealed to
 be unhelpful.
 
