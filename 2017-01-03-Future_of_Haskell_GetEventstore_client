@@ -1,0 +1,65 @@
+Been already 2 years since I first released a [client][] for [GetEventstore][] (GES) database.
+Back when I was introduced to GES, I felt immediately in love with it. However, I didn't want
+to leave that comfy blanket functional programming gives you. To certain extend, we could
+agree most functional programming patterns are doable in any language. Fair enough.
+[GetEventStore][] officially supports 2 clients: One in C# and the other targets JVM platform but
+entirely written in Scala.
+
+Been a long time ago since the last line of C# I wrote. Besides, it's way too
+imperative for my liking. No big deal though, they provide a Scala binding and since
+I'm a seasoned Scala programmer, it should be a no-brainer. But, with all due respect, I really
+don't like how it's written nor the technology stack used. It uses Akka, which I never been a big
+fan of. It's way too overkill and bloated for only sending protobuf messages on the wire. I tend
+to think I wasn't the only one to feel that way, considering how greatly the [pure Java 8 client][]
+was welcomed.
+
+At the end, I feel it would be interesting to roll my own driver in a language I really enjoy writing
+code in. I shot an [email][] to GetEventstore mailing list, desperately seeking for information.
+I was prepared so I started working on it.
+
+During those 2 years, I got many feedback. That's why I want to personally thank all the people
+who reached out with me via mail or Github issues to improve the quality of the code. Much
+appreciated since I wasn't aware of all those [GetEventStore][] setups. It also
+cast some light upon areas I wasn't paying attention enough.
+
+#### What's next now ?
+
+The [client][] is in pretty good shape now but there's still room for improvement. I want
+to revamp the internal operation management API. There are also a bit of technical debt here
+and there but nothing serious.
+
+Feature wise, the Haskell [client][] implements every functionality exposed by the
+[GetEventStore][] database. However, there are orthogonal features of the C# client
+that are worth having.
+
+I don't have an exhaustive list yet, but here's a summary:
+* Better tracking of timeouts. The C# driver can tell you when an operation took too
+much time to complete or a volatile subscription waiting for ages before receiving a confirmation.
+Currently, the Haskell [client][] would wait endlessly for those operations to complete. I never
+stumble upon this issue a single time but it's certainly worthwhile to have.
+
+* Better logging: Currently logging is really weak in the Haskell [client][]. I decided to
+implement every log statement as a data structure. One could implement a logging system just by
+submitting a function of `Log -> IO ()` to the [client][] settings. It's very flexible because
+you can pattern match an `ErrorMessage` or `InfoMessage` and implement a tailored textual
+representation. The C# chose a more classic approach. At the end of the day, I want it to be
+useful so I may switch back to a classical approach too if my first attempt revealed to
+be unhelpful.
+
+* Add more utility functions to construct non conventional events like linked events. Currently,
+the user needs to read [GetEventStore][] documentation and set the right metadata information
+to do it.
+
+I probably forgot a lot here but those are the most important one that come to mind. That's being said, I
+might not be fully aware of all those small details the C# client has. I should probably ask on
+the mailing list.
+
+Don't hesitate to talk with me on Twitter or for more precise questions / remarks, drop a comment
+[there][].
+
+[client]: https://github.com/YoEight/eventstore
+[GetEventStore]: https://geteventstore.com
+[GES]: https://geteventstore.com
+[pure Java 8 client]: https://github.com/msemys/esjc
+[email]: https://groups.google.com/forum/#!topic/event-store/xUOM6i-uDRY
+[there]: https://github.com/YoEight/website-posts/issues/3
