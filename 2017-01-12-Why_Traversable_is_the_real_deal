@@ -1,0 +1,222 @@
+`Traversable`, in my view, is a pure gem from the Haskell standard library. I
+was introduced by it through [The Essence of Iterator pattern][] quite some time
+ago. Now I know this paper backwards and I think you should too.
+
+In today's post I will talk about it and hope to get more people into it. This
+post is targeted for beginner and intermediate Haskell developers. It assumes the reader
+has a good grasp of `Applicative` functor typeclass. I purposely chose to use
+a point-free style as much as possible to emphasize on Haskell expressiveness.
+At the same time, it's valuable skill to really understand the power of (`(.)`)
+composition function.
+
+### What `Traversable` typeclass is about ?
+
+I introduce a slightly altered version of `Traversable` typeclass (by dropping
+the `Foldable` constraint, which add no value at all in my opinion).
+
+```haskell
+class Functor t => Traversable t where
+  traverse :: Applicative f => (a -> f b) -> t a -> f (t b)
+```
+
+Basically, what `traverse` does is to abstract over how a structure can be folded
+while allowing to apply an effectful computation (as long as it implements
+`Applicative`) on every element that structure provides.
+
+Here's an example with list.
+
+```haskell
+instance Traversable [] where
+  traverse _ []     = pure []
+  traverse f (a:as) = (:) <$> f a <*> traverse f as
+```
+
+### What can we do with it ?
+
+For the purpose of this post, I will show we can implement numerous familiar
+functions just by sticking to `traverse`-based functions. But first we have to
+discover `Constant` data structure.
+
+```haskell
+newtype Constant m a = Constant { constant :: m }
+```
+
+The `a` parameter of `Constant` is called a phantom type. In this case, it's
+little trick that allows us to implement typeclasses such as `Functor` and
+`Applicative`.
+
+```haskell
+instance Functor (Constant m) where
+  fmap _ (Constant m) = Constant m
+```
+
+Because there is no `a` to map over, we just return the `m` value unchanged.
+That's why it's called `Constant` after all. Now comes the `Applicative`
+implementation.
+
+```haskell
+instance Monoid m => Applicative (Constant m) where
+  pure _ = Constant mempty
+
+  Constant m <*> Constant m' = Constant (m <> m')
+```
+
+Something different happens with its `Applicative` instance though. It will allow
+any `Monoid` instance type to be used by `traverse` function. We will take
+great advantage of this feature further in this post.
+
+#### Implement `foldMap`
+
+One reason I cut `Foldable` constraint on `Traversable` is the fact that
+`foldMap` can be implemented with `traverse`.
+
+```haskell
+foldMap :: (Traversable f, Monoid m) => (a -> m) -> f a -> m
+foldMap f = constant . traverse (Constant . f)
+```
+
+`Constant` is used as a wrapper allowing us to use `traverse`.
+
+### Implement `foldr`
+
+To do it, we need to introduce the `Endo` structure.
+
+```haskell
+newtype Endo a = Endo { endo :: a -> a }
+```
+
+`Endo` happens to be a `Monoid` instance. It might not be obvious but here how
+it goes.
+
+```haskell
+instance Monoid (Endo a) where
+  mempty = Endo id
+
+  mappend (Endo f) (Endo g) = Endo (g . f)
+```
+
+Thanks to `Endo`, `foldr` becomes a one-liner implemention:
+
+```haskell
+foldr :: Traversable f => (a -> s -> s) -> s -> f a -> s
+foldr f seed ta = endo (foldMap (Endo . f) ta) seed
+```
+
+### Implement `foldl`
+
+As one would figure out, `foldl` slightly differs from `foldr`:
+
+```haskell
+foldl :: Traversable f => (s -> a -> s) -> s -> f a -> s
+foldl f seed ta = endo (foldMap (Endo . flip f) ta) seed
+```
+
+We only used `flip` to switch `f` parameters to appease the compiler.
+
+### Implement `find`
+
+`find` seeks out for the first element and stop when one conforms with the
+given predicate.
+
+```haskell
+find :: Traversable t => (a -> Bool) -> t a -> Maybe a
+```
+
+At this point we need to introduce `First` `Monoid`
+
+```haskell
+newtype First a = First { getFirst :: Maybe a }
+
+
+instance Monoid (First a) where
+  mempty = First Nothing
+
+  mappend (First a) (First a') = First (a <|> a')
+```
+
+We take advantage of `Maybe` `Alternative` instance. if `a` is `Just` then `a`
+is picked. Otherwise, `a'` is chosen. `find` can be expressed simply like this:
+
+```haskell
+find :: Traversable f => (a -> Bool) -> f a -> Maybe a
+find f = getFirst . foldMap go
+  where
+    go a
+      | f a       = First $ Just a
+      | otherwise = mempty
+```
+
+### Implement `any`
+
+`any` returns `True` if at least one element of a `Traversable` structure
+complies with the given predicate.
+
+To help us, we introduce `Or` structure.
+
+```haskell
+newtype Or = Or { unOr :: Bool }
+
+instance Monoid Or where
+  mempty = Or False
+
+  mappend (Or a) (Or b) = Or (a || b)
+```
+
+It basically exposes boolean disjunction function as a `Monoid`. `any` follows
+the pattern of previous function implementations.
+
+```haskell
+any :: Traversable f => (a -> Bool) -> f a -> Bool
+any f = unOr . foldMap (Or . f)
+```
+
+### Implement `all`
+
+`all`, unlike `any`, makes sure every element of `Traversable` structure
+complies with the given predicate. We will use `And`, it represent boolean
+conjunction function as a `Monoid`.
+
+```haskell
+newtype And = And { unAnd :: Bool }
+
+instance Monoid And where
+  mempty = And True
+
+  mappend (And a) (And b) = And (a && b)
+```
+
+`all` is very similar to `any` in this regard.
+
+```haskell
+all :: Traversable f => (a -> Bool) -> f a -> Bool
+all f = unAnd . foldMap (And . f)
+```
+
+### Exercises for the reader
+
+One could find many other functions following this pattern. Here are some fun
+to implement:
+
+* `min`: Returns the smallest value of a `Traversable`.
+* `max`: Returns the biggest value.
+* `sum`: Sum every elements.
+* `lastest`: Returns the last element.
+* `average`: Returns the mean value.
+
+### Conclusion
+
+As stated in the title, `Traversable` is the real deal. It allows us to derive
+a numerous function thanks to its very simple yet effective `traverse` function.
+It separates how you iterate over a structure from what you do with each
+value you come across during the process.
+
+As a result of its usefulness, it's a typeclass often derived by library
+implementors. Master it will greatly improve your Haskell understanding, making
+you a better programmer at end.
+
+If you have any question or want to challenge what
+I said, please reach out on Twitter or for more complex interaction, consider
+this [thread][] on Github.
+
+[The Essence of Iterator pattern]: https://www.cs.ox.ac.uk/jeremy.gibbons/publications/iterator.pdf
+[thread]: https://github.com/YoEight/website-posts/issues/5
