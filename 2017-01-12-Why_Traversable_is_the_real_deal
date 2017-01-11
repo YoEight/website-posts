@@ -65,7 +65,7 @@ Something different happens with its `Applicative` instance though. It will allo
 any `Monoid` instance type to be used by `traverse` function. We will take
 great advantage of this feature further in this post.
 
-#### Implement `foldMap`
+### Implement `foldMap`
 
 One reason I cut `Foldable` constraint on `Traversable` is the fact that
 `foldMap` can be implemented with `traverse`.
@@ -206,7 +206,7 @@ to implement:
 ### Conclusion
 
 As stated in the title, `Traversable` is the real deal. It allows us to derive
-a numerous function thanks to its very simple yet effective `traverse` function.
+a numerous functions thanks to its very simple yet effective `traverse` function.
 It separates how you iterate over a structure from what you do with each
 value you come across during the process.
 
