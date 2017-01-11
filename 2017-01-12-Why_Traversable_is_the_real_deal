@@ -1,5 +1,5 @@
 `Traversable`, in my view, is a pure gem from the Haskell standard library. I
-was introduced by it through [The Essence of Iterator pattern][] quite some time
+was introduced to it through [The Essence of Iterator pattern][] quite some time
 ago. Now I know this paper backwards and I think you should too.
 
 In today's post I will talk about it and hope to get more people into it. This
