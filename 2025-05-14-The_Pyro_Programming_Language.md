@@ -29,3 +29,25 @@ print ! "Hello, World!"
 ```
 
 Unfamiliar syntax? Think of `print` as a process, and the `!` operator as a way to send it a message—in this case, the string `"Hello, World!"`. If you’ve used Scala with the Akka framework, this should feel familiar. It’s similar to sending a message to an Actor, where `print` plays the role of the actor in this example.
+
+The following example shows how receiving a message looks like.
+
+```
+echo ? msg = print ! msg
+```
+
+`echo` is a process, and the `?` operator means “wait for” a message—here, bound to `msg` variable. When a message arrives, the expression after the `=` is executed. In this case, it sends the received `msg` to the `print` process. Pyro supports pattern matching, so one could have written that alternative instead:
+
+```
+echo ? [x] = print ! x
+```
+
+We expect an array containing a single element and bind that element to the x variable. Finally, we send x to the print process.
+
+Process communicatioin aside, Pyro is very similar to Lisp and use prefix notation for functions:
+
+```
+(+ 1 2)
+```
+
+Which is the equivalent of the infix notation `1 + 2`.
