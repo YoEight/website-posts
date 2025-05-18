@@ -51,3 +51,34 @@ Process communicatioin aside, Pyro is very similar to Lisp and use prefix notati
 ```
 
 Which is the equivalent of the infix notation `1 + 2`.
+
+You can define functions in Pyro, though they’re more like syntactic sugar for creating processes—essentially an abstraction layer. The syntax might look unfamiliar at first,
+but it should still be understandable with a bit of context.
+
+```
+(def foobar [x y] = (x ! y | x ! y))
+```
+
+As a process abstraction, `foobar` can only return another process. For example, you can't return a number. In this case, `foobar` defines a process that waits for a message: specifically, an array containing exactly two elements.
+This is how Pyro supports parameters. At its core, a process can only receive a single message, so if you need to pass multiple arguments, you wrap them in an array. The `|` operator
+in Pyro represents parallel execution. In this snippet, we send the message `y` to the process `x` twice in parallel.
+
+Let’s look at a more involved example. Pyro is functional by design and doesn’t include traditional looping constructs like `for` or `while`. Instead, looping behavior can be achieved by defining a process abstraction that uses recursion.
+
+```
+(def for [min: Integer max: Integer f: ![Integer ^[]] done: ^[]] =
+  (def loop x : Integer =
+    if (<= x max) then
+      (new c : ^[]
+        ( f ! [x c] | c?[] = loop ! (+ x 1)))
+    else
+      done ! []
+
+  loop ! min ))
+```
+
+Admittedly, this looks a lot more intimidating than your typical for loop. Let’s break down the syntax to make it more approachable.
+
+`min: Integer` is a standard variable declaration. Arrays in Pyro can have labels, which are optional. Labels introduce variable names bound to their corresponding values, and optionally, their types. When labeling types, `!` denotes a `Client`—a process that can only be sent messages. The `^` symbol represents a `Channel`, which means it can both send and receive messages. In Pyro, a `Client` is write-only, a `Receiver` is read-only, and a `Channel` combines both capabilities.
+
+Now, about `f: ![Integer ^[]]`: this means `f` is a `Client` that expects to receive an array of two elements. The first is an `Integer`, and the second is a `Channel` that handles an empty array. In other words, `f` can be sent a message consisting of a number and a communication endpoint that expects no input.
