@@ -159,3 +159,35 @@ In the context of KurrentDB, user-defined projections can’t dynamically change
 What I needed was a programming language where waiting for a message or an event is a first-class concept—something more expressive than simply calling a function. It’s worth noting this wasn’t driven by a work or business requirement. It came from a personal belief that the π-calculus paradigm captures my vision of what KurrentDB could be as a programmable data platform.
 
 That vision also led to another experimental project: GethDB, a database designed to embody this idea of programmability at its core. I plan to talk more about that project another time. For now, Pyro is the language that lets me explore and realize those ideas.
+
+# Design Decisions and Trade-offs
+
+The project is divided in four parts:
+
+1. **pyro-core** : A library that contains core types, tokenizer, parser and type system.
+1. **pyro-runtime**: A library that contains the actual runtime of Pyro.
+1. **pyro-repl**: Is Read-Eval-Print-Loop or REPL program for Pyro. It uses both `pyro-core` and `pyro-runtime`. It's a simple interactive programming environment where the user inputs expressions.
+1. **pyro**: Like `pyro-repl`, it uses both `pyro-core` and `pyro-runtime`. It runs Pyro programs. The difference with `pyro-repl` is it expects a complete program, not just expression.
+
+The front-end of the compiler uses a handcrafted tokenizer and parser. Contrary to popular belief, this approach often leads to faster iteration. You can power through implementation details without getting bogged down by things like grammar ambiguities—since you usually have enough context at each step to make the right decision. Error reporting tends to be significantly better, too, because that same context allows you to produce more meaningful messages for the user. Debugging is also more straightforward; you’re not dealing with opaque parser generator state machines or tangled semantic actions—you’re just stepping through plain, understandable code.
+
+I splited the project in smaller part because I wanted the language to be embeddable. Having `pyro-runtime` as library allows me to add different built-ins functions based on the program I want to use Pyro. For example,
+when I integrated Pyro in my GethDB database, I added functions (should I say processes) that are specific to GethDB. I won't go over all the nitty gritty details but it looks like this.
+
+```rust
+pub fn create_pyro_runtime(client: SubscriptionClient, name: &String) -> eyre::Result<PyroRuntime> {
+    // ...
+    // Setup code that declares most of the variables that we use below.
+    // ...
+    let engine = Engine::with_nominal_typing()
+        .stdlib(env)
+        .register_type::<EventEntry>("Entry")
+        .register_type::<EventRecord>("EventRecord")
+        .register_value("output", ProgramOutput(send_output))
+        .register_function("subscribe", move |stream_name: String| {
+            // Code that actually plug code from the GethDB internal API to the Pyro plugins.
+        })
+        .build()?;
+    // ...
+}
+```
