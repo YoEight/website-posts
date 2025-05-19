@@ -145,3 +145,17 @@ run
         done]
     | done?[] = print ! "Done!")))
 ```
+
+# Why I built it?
+
+It all started when I wanted to go beyond what’s currently possible with KurrentDB (formerly EventStoreDB) user-defined projections. KurrentDB lets users write projections in JavaScript, which works well for a specific class of queries known as temporal correlation queries—common in many business systems. Temporal correlation queries are queries that relate or correlate multiple events based on their temporal (time-based) relationships. These are particularly useful in event-driven or stream processing systems where understanding when something happened and in what order is just as important as what happened. An example of temporal correlation query would be:
+
+```
+If temperature > 80°C for 10 consecutive minutes, trigger an alert.
+```
+
+In the context of KurrentDB, user-defined projections can’t dynamically change the types of events they listen to. This isn’t a limitation of KurrentDB itself, but rather of the language used to express those projections.
+
+What I needed was a programming language where waiting for a message or an event is a first-class concept—something more expressive than simply calling a function. It’s worth noting this wasn’t driven by a work or business requirement. It came from a personal belief that the π-calculus paradigm captures my vision of what KurrentDB could be as a programmable data platform.
+
+That vision also led to another experimental project: GethDB, a database designed to embody this idea of programmability at its core. I plan to talk more about that project another time. For now, Pyro is the language that lets me explore and realize those ideas.
