@@ -81,4 +81,67 @@ Admittedly, this looks a lot more intimidating than your typical for loop. Let�
 
 `min: Integer` is a standard variable declaration. Arrays in Pyro can have labels, which are optional. Labels introduce variable names bound to their corresponding values, and optionally, their types. When labeling types, `!` denotes a `Client`—a process that can only be sent messages. The `^` symbol represents a `Channel`, which means it can both send and receive messages. In Pyro, a `Client` is write-only, a `Receiver` is read-only, and a `Channel` combines both capabilities.
 
-Now, about `f: ![Integer ^[]]`: this means `f` is a `Client` that expects to receive an array of two elements. The first is an `Integer`, and the second is a `Channel` that handles an empty array. In other words, `f` can be sent a message consisting of a number and a communication endpoint that expects no input.
+Now, about `f: ![Integer ^[]]`: this means `f` is a `Client` that expects a message containing an array with two elements. The first is an `Integer`, and the second is a `Channel` that handles an empty array—in other words, a communication endpoint used like a signal.
+
+The `new` keyword creates a new `Channel` and binds it to the variable `c`. With the syntax clarified, let’s look at how the for loop is implemented. The `min` and `max` values define the bounds of the loop: the starting and ending integers for the recursion. The `f` process is invoked on each iteration. Notably, the second element expected by `f` is a `Channel` it must use to signal whether to continue the loop. To do that, `f` sends an empty array `[]` to indicate the loop should proceed.
+
+The `done` `Channel` is used to signal the end of the iteration sequence. The loop itself is implemented through a local process named `loop`, which takes the current iteration value as its parameter—bound to the variable `x`. The logic is straightforward: if `x` is less than or equal to `max`, the loop sends both the current value and a continuation `Channel` to `f`. This `Channel` allows `f` to notify whether to continue the next iteration.
+
+Let’s zoom in on that part:
+
+```
+if (<= x max) then
+  (new c : ^[]
+    ( f ! [x c] | c?[] = loop ! (+ x 1)))
+```
+
+In this branch of the code, we run two processes in parallel: `f ! [x c]` and `c?[] = loop ! (+ x 1)`. The first expression, `f ! [x c]`, sends the current iteration value `x` along with the continuation channel `c` to the `f` process. This allows `f` to perform its work and decide whether to continue the loop.
+
+The second expression, `c?[] = loop ! (+ x 1)`, waits for a signal—specifically an empty message `[]`—from `f`. If `f` sends this signal, it means the loop should proceed, and we call loop recursively with the incremented value of `x`.
+
+When the current value of `x` exceeds the `max` bound, we exit the loop by sending `[]` to the `done` channel, as shown here:
+
+```
+else
+  done ! []
+```
+
+The `for` process starts with `loop ! min` which starts the local process `loop` with the `min` value.
+
+This how the `for` process can be used:
+
+```
+(new done : ^[]
+  ( for ! [1 4 \[x c] = (print ! x | c ! []) done]
+  | done?[] = print ! "Done!")))
+```
+
+It will produce this output:
+
+```
+1
+2
+3
+4
+"Done!"
+```
+
+The complete snippet is:
+
+```
+run
+  (def for [min: Integer max: Integer f:![Integer ^[]] done: ^[]] =
+    (def loop x:Integer =
+        if (<= x max) then
+            (new c : ^[]
+            ( f ! [x c]
+            | c?[] = loop!(+ x 1)))
+        else
+            done ! []
+    loop ! min )
+  (new done : ^[]
+    ( for! [1 4
+        \[x c] = (print ! x | c ! [])
+        done]
+    | done?[] = print ! "Done!")))
+```
