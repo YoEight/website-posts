@@ -4,7 +4,7 @@ Pyro began as an attempt to find a better way to describe user-defined projectio
 
 While Pyro isn’t meant for production use, it evolved into a valuable playground—one where I could model event streams, experiment with concurrency, and reason about time through code.
 
-## What is  π-calculus ?
+## What is π-calculus ?
 
 The π-calculus is a mathematical model for describing concurrent systems, where multiple processes run independently and communicate with each other. It focuses on how processes exchange messages through channels, and uniquely, it allows those channels to be created and passed around dynamically.
 
@@ -169,7 +169,115 @@ The project is divided in four parts:
 1. **pyro-repl**: Is Read-Eval-Print-Loop or REPL program for Pyro. It uses both `pyro-core` and `pyro-runtime`. It's a simple interactive programming environment where the user inputs expressions.
 1. **pyro**: Like `pyro-repl`, it uses both `pyro-core` and `pyro-runtime`. It runs Pyro programs. The difference with `pyro-repl` is it expects a complete program, not just expression.
 
-The front-end of the compiler uses a handcrafted tokenizer and parser. Contrary to popular belief, this approach often leads to faster iteration. You can power through implementation details without getting bogged down by things like grammar ambiguities—since you usually have enough context at each step to make the right decision. Error reporting tends to be significantly better, too, because that same context allows you to produce more meaningful messages for the user. Debugging is also more straightforward; you’re not dealing with opaque parser generator state machines or tangled semantic actions—you’re just stepping through plain, understandable code.
+The frontend of the compiler uses a handcrafted tokenizer and parser. Contrary to popular belief, this approach often leads to faster iteration. You can power through implementation details without getting bogged down by things like grammar ambiguities—since you usually have enough context at each step to make the right decision. Error reporting tends to be significantly better, too, because that same context allows you to produce more meaningful messages for the user. Debugging is also more straightforward; you’re not dealing with opaque parser generator state machines or tangled semantic actions—you’re just stepping through plain, understandable code.
+
+For the backend, I opted to write an interpreter for simplicity. It's a toy project, after all. While generating native code with something like LLVM would have been an exciting challenge, it would also have required a significant time investment. I even considered targeting JVM bytecode instead, since it abstracts away many of the lower-level concerns like calling conventions, register and stack management, memory layout, and threading. In the end, I chose to build an interpreter in Rust and use the Tokio library. Tokio provides built-in support for channels, complete with sender and receiver ends, which fits perfectly with Pyro’s process model. It also includes features like channel closure detection, which makes it easier to implement resource cleanup in more contrived scenarios. It’s far from production-ready, but for a toy project, it does the job well.
+
+A Pyro interpreter main entrypoint is basically this:
+
+```rust
+impl PyroProcess {
+    pub async fn run(self) -> eyre::Result<()> {
+        let mut work_items = Vec::new();
+        let (sender, mut mailbox) = mpsc::unbounded_channel::<Msg>();
+
+        for tag in self.program {
+            work_items.push(Suspend {
+                runtime: self.runtime.clone(),
+                proc: tag,
+            });
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut gauge = 0i32;
+            let mut proc_id_gen = 0u64;
+
+            while let Some(msg) = mailbox.recv().await {
+                match msg {
+                    Msg::Job(out, s) => {
+                        let proc_id = proc_id_gen;
+                        proc_id_gen += 1;
+
+                        tokio::spawn(async move {
+                            let local_runtime = s.runtime.clone();
+                            match execute_proc(s.runtime, s.proc).await {
+                                Err(e) => {
+                                    local_runtime
+                                        .println(format!("UNEXPECTED RUNTIME ERROR: {}", e));
+                                }
+
+                                Ok(jobs) => {
+                                    for next in jobs {
+                                        let _ = out.send(Msg::Job(out.clone(), next));
+                                    }
+                                }
+                            };
+
+                            let _ = out.send(Msg::Completed(proc_id));
+                        });
+
+                        gauge += 1;
+                    }
+
+                    Msg::Completed(_proc_id) => {
+                        gauge -= 1;
+                        if gauge <= 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        for job in work_items {
+            let _ = sender.send(Msg::Job(sender.clone(), job));
+        }
+
+        handle.await?;
+        Ok(())
+    }
+}
+```
+The interpreter runs as a manager thread that keeps track of active processes. When no processes are left, it knows it can safely exit. This is managed through a variable named `gauge`—admittedly a poor name. While this tracking approach is quite rudimentary, it turned out to be surprisingly effective given how little time it took to implement. I can’t formally prove its correctness, but in practice, I haven’t encountered any divergent behavior so far.
+
+This is what a process is in Pyro:
+
+```rust
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Tag<I, A> {
+    pub item: I,
+    pub tag: A,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Proc<A> {
+    Output(Tag<Val<A>, A>, Tag<Val<A>, A>),
+    Input(Tag<Val<A>, A>, Tag<Abs<A>, A>),
+    Null, // ()
+    Parallel(Vec<Tag<Proc<A>, A>>),
+    Decl(Tag<Decl<A>, A>, Box<Tag<Proc<A>, A>>),
+    Cond(Tag<Val<A>, A>, Box<Tag<Proc<A>, A>>, Box<Tag<Proc<A>, A>>),
+}
+```
+
+I reused the `Proc` definition from the Abstract Syntax Tree (AST). It's a generic type, which makes it versatile enough to be shared across multiple stages of the compiler, such as annotation and type checking. I realize there’s a lot to unpack here, but I don’t intend to cover every detail of the compilation pipeline. Even as a toy project, each part of the compiler could warrant its own in-depth explanation.
+
+While much of this isn’t unique to Pyro, it still serves as a gentle introduction to fundamental concepts in compiler engineering. That alone might be enough to spark someone’s curiosity and encourage them to dive deeper into how compilers work.
+
+Now, back to `Proc`. Here’s a breakdown of what each variant represents:
+
+- **`Output`**: Represents sending a message on a channel. The left side must be a channel that can be written to (also called a `Client`), while the right side can be any value — like `foo ! 42`.
+
+- **`Input`**: Represents receiving a message from a channel. The left side must be a channel that can be read from (also called a `Receiver`), and the right side acts like a callback to handle the received message — for example, `foo ? x = print ! x`.
+
+- **`Null`**: Represents an empty process that does nothing — written as `()`.
+
+- **`Parallel`**: Represents the parallel execution operator `|`. It can be repeated for multiple processes — for instance, `a | b | c`.
+
+- **`Decl`**: Represents a named process definition. While this is similar to a function or method in traditional programming languages, I chose not to use that terminology to avoid confusion with π-calculus concepts — for example, `(def foobar x: Integer = print ! x)`.
+
+- **`Cond`**: Represents a conditional branch. The first part must evaluate to a boolean, and the two branches must be processes — like `if (== x y) then foo else bar`.
+
 
 I splited the project in smaller part because I wanted the language to be embeddable. Having `pyro-runtime` as library allows me to add different built-ins functions based on the program I want to use Pyro. For example,
 when I integrated Pyro in my GethDB database, I added functions (should I say processes) that are specific to GethDB. I won't go over all the nitty gritty details but it looks like this.
