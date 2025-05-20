@@ -260,9 +260,7 @@ pub enum Proc<A> {
 }
 ```
 
-I reused the `Proc` definition from the Abstract Syntax Tree (AST). It's a generic type, which makes it versatile enough to be shared across multiple stages of the compiler, such as annotation and type checking. I realize there’s a lot to unpack here, but I don’t intend to cover every detail of the compilation pipeline. Even as a toy project, each part of the compiler could warrant its own in-depth explanation.
-
-While much of this isn’t unique to Pyro, it still serves as a gentle introduction to fundamental concepts in compiler engineering. That alone might be enough to spark someone’s curiosity and encourage them to dive deeper into how compilers work.
+I reused the `Proc` definition from the Abstract Syntax Tree (AST). It's a generic type, which makes it versatile enough to be shared across multiple stages of the compiler, such as annotation and type checking. I realize there’s a lot to unpack here, but I don’t intend to cover every detail of the compilation pipeline. Even as a toy project, each part of the compiler could warrant its own in-depth explanation. While much of this isn’t unique to Pyro, it still serves as a gentle introduction to fundamental concepts in compiler engineering. That alone might be enough to spark someone’s curiosity and encourage them to dive deeper into how compilers work.
 
 Now, back to `Proc`. Here’s a breakdown of what each variant represents:
 
