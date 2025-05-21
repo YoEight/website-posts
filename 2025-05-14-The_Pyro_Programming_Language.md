@@ -169,7 +169,30 @@ The project is divided in four parts:
 1. **pyro-repl**: Is Read-Eval-Print-Loop or REPL program for Pyro. It uses both `pyro-core` and `pyro-runtime`. It's a simple interactive programming environment where the user inputs expressions.
 1. **pyro**: Like `pyro-repl`, it uses both `pyro-core` and `pyro-runtime`. It runs Pyro programs. The difference with `pyro-repl` is it expects a complete program, not just expression.
 
+I splited the project in smaller part because I wanted the language to be embeddable. Having `pyro-runtime` as library allows me to add different built-ins functions based on the program I want to use Pyro. For example,
+when I integrated Pyro in my GethDB database, I added functions (should I say processes) that are specific to GethDB. I won't go over all the nitty gritty details but it looks like this.
+
+```rust
+pub fn create_pyro_runtime(client: SubscriptionClient, name: &String) -> eyre::Result<PyroRuntime> {
+    // ...
+    // Setup code that declares most of the variables that we use below.
+    // ...
+    let engine = Engine::with_nominal_typing()
+        .stdlib(env)
+        .register_type::<EventEntry>("Entry")
+        .register_type::<EventRecord>("EventRecord")
+        .register_value("output", ProgramOutput(send_output))
+        .register_function("subscribe", move |stream_name: String| {
+            // Code that actually plug code from the GethDB internal API to the Pyro plugins.
+        })
+        .build()?;
+    // ...
+}
+```
+
 The frontend of the compiler uses a handcrafted tokenizer and parser. Contrary to popular belief, this approach often leads to faster iteration. You can power through implementation details without getting bogged down by things like grammar ambiguities—since you usually have enough context at each step to make the right decision. Error reporting tends to be significantly better, too, because that same context allows you to produce more meaningful messages for the user. Debugging is also more straightforward; you’re not dealing with opaque parser generator state machines or tangled semantic actions—you’re just stepping through plain, understandable code.
+
+#### <TALK A BIT ABOUT THE TYPE SYSTEM>
 
 For the backend, I opted to write an interpreter for simplicity. It's a toy project, after all. While generating native code with something like LLVM would have been an exciting challenge, it would also have required a significant time investment. I even considered targeting JVM bytecode instead, since it abstracts away many of the lower-level concerns like calling conventions, register and stack management, memory layout, and threading. In the end, I chose to build an interpreter in Rust and use the Tokio library. Tokio provides built-in support for channels, complete with sender and receiver ends, which fits perfectly with Pyro’s process model. It also includes features like channel closure detection, which makes it easier to implement resource cleanup in more contrived scenarios. It’s far from production-ready, but for a toy project, it does the job well.
 
@@ -276,24 +299,79 @@ Now, back to `Proc`. Here’s a breakdown of what each variant represents:
 
 - **`Cond`**: Represents a conditional branch. The first part must evaluate to a boolean, and the two branches must be processes — like `if (== x y) then foo else bar`.
 
-
-I splited the project in smaller part because I wanted the language to be embeddable. Having `pyro-runtime` as library allows me to add different built-ins functions based on the program I want to use Pyro. For example,
-when I integrated Pyro in my GethDB database, I added functions (should I say processes) that are specific to GethDB. I won't go over all the nitty gritty details but it looks like this.
+Let’s take a look at how processes are interpreted internally. I won’t dive too deep into the implementation details, as that would make this article overly long. The goal here is simply to introduce a few key entry points:
 
 ```rust
-pub fn create_pyro_runtime(client: SubscriptionClient, name: &String) -> eyre::Result<PyroRuntime> {
-    // ...
-    // Setup code that declares most of the variables that we use below.
-    // ...
-    let engine = Engine::with_nominal_typing()
-        .stdlib(env)
-        .register_type::<EventEntry>("Entry")
-        .register_type::<EventRecord>("EventRecord")
-        .register_value("output", ProgramOutput(send_output))
-        .register_function("subscribe", move |stream_name: String| {
-            // Code that actually plug code from the GethDB internal API to the Pyro plugins.
-        })
-        .build()?;
-    // ...
+async fn execute_proc(
+    mut runtime: Runtime,
+    proc: Tag<Proc<Ann>, Ann>,
+) -> eyre::Result<Vec<Suspend>> {
+    let mut sus = Vec::new();
+
+    match proc.item {
+        Proc::Output(target, param) => {
+            if let Some(suspend) = execute_output(&mut runtime, target, param).await? {
+                sus.push(suspend);
+            }
+        }
+
+        Proc::Input(source, abs) => {
+            if let Some(suspend) = execute_input(&mut runtime, source, abs).await? {
+                sus.push(suspend);
+            }
+        }
+        Proc::Null => {}
+
+        Proc::Parallel(procs) => {
+            for proc in procs {
+                sus.push(Suspend {
+                    runtime: runtime.clone(),
+                    proc,
+                });
+            }
+        }
+
+        Proc::Decl(decl, proc) => {
+            runtime.register(decl.item);
+            sus.push(Suspend {
+                runtime,
+                proc: *proc,
+            });
+        }
+
+        Proc::Cond(test, if_proc, else_proc) => {
+            let test = interpret(&mut runtime, test.item).await?;
+            let test = test.bool()?;
+            let proc = if test { if_proc } else { else_proc };
+
+            sus.push(Suspend {
+                runtime,
+                proc: *proc,
+            })
+        }
+    };
+
+    Ok(sus)
 }
 ```
+
+The `Runtime` type maintains the current state of the interpreter—for example, it keeps a registry of all variables and their associated scopes. The process being executed is represented as a full tree, annotated with both source code positions and type information:
+
+```rust
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ann {
+    pub pos: Pos,
+    pub r#type: TypePointer,
+}
+```
+
+`TypePointer` is a somewhat complex type, but at its core, it defines how a type expression should be evaluated—making type checking easier to implement. During interpretation, if executing a process yields a new process, we wrap it in a `Suspension`. A suspension refers to a computation that has been paused (suspended) and can be resumed later:
+
+```rust
+struct Suspend {
+    runtime: Runtime,
+    proc: Tag<Proc<Ann>, Ann>,
+}
+```
+
+When produced, a suspension will be executed later on by the manager thread that I showed above.
