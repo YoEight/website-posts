@@ -383,3 +383,11 @@ struct Suspend {
 ```
 
 When produced, a suspension will be executed later on by the manager thread that I showed above.
+
+# What I learned?
+
+Constraining yourself helps sharpen your understanding of what truly matters in the runtime.  I'm not entirely convinced that the exit condition of the runtime (when there is no more channel in use) to be 100% foolproof. Worst case scenario, the runtime will just idling. I'm confident that I know the core features that I need from a runtime point of view, I won't waste anytime dunking around if I ever wanted to make the runtime more production ready. Another possibilty would to use LLVM to generate the machine code. I'm unsured that we can benefit from much that level of control to get all the optimization that we can get when poundering it with the cost of implement the LLVM backend.
+
+Building from the ground up with concurrency in mind changes the languages's shape drastically. The synthax is very unfamiliar. It also requires a paradigm shift when thinking about functions. Those are all processes, even the ones that are created through anonymous/lamdba expresions. Everything is about sending a message. It's incrediable how Smalltalk was ahead of its time in this regard. In the case of Pyro, it allows to express dynamic network topologies, where the interconnections between components can change over time. Not every theoretical idea makes for good syntax or runtime behavior. and that tension is part of the fun.
+
+# Final Thoughts
