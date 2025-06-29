@@ -395,3 +395,9 @@ Building from the ground up with concurrency in mind changes the language's shap
 Pyro is not a production tool. It's a learning artifact, one that helped me internalize a complex body of knowledge through concrete experimentation. If you're curious, I encourage you to browse the code, run the interpreter, or even  fork the project and build your own toy language.
 
 Learning is most powerful when it's hands-on, and nothing is more hands-on than building your own tools.
+
+# Acknowledgements
+
+Special thanks to Greg Young, the original author of the EventStore database, who suggested I look into π-calculus theory when I discussed my ideas for improving temporal query modeling.
+
+Pyro also draws significant inspiration from the Pict programming language, which is likely the first implementation of π-calculus theory.
