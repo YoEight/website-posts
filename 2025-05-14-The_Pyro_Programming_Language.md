@@ -2,7 +2,7 @@
 
 Pyro began as an attempt to find a better way to describe user-defined projections in KurrentDB (formerly EventStoreDB)—specifically, the kind of temporal correlation queries that are difficult to express clearly using existing tools. That exploration led me to design a small programming language inspired by the π-calculus and built with concurrency and messaging as first-class concepts.
 
-While Pyro isn’t meant for production use, it evolved into a valuable playground—one where I could model event streams, experiment with concurrency, and reason about time through code.
+While Pyro isn’t meant for production use, it evolved into a valuable playground—one where I could model event streams, experiment with concurrency, and reason about time through code. [You can view the Pyro compiler on Github].
 
 ## What is π-calculus ?
 
@@ -192,7 +192,7 @@ pub fn create_pyro_runtime(client: SubscriptionClient, name: &String) -> eyre::R
 
 ### The compiler's frontend
 
-The frontend of the compiler uses a handcrafted tokenizer and parser. Contrary to popular belief, this approach often leads to faster iteration. You can power through implementation details without getting bogged down by things like grammar ambiguities—since you usually have enough context at each step to make the right decision. Error reporting tends to be significantly better, too, because that same context allows you to produce more meaningful messages for the user. Debugging is also more straightforward; you’re not dealing with opaque parser generator state machines or tangled semantic actions—you’re just stepping through plain, understandable code.
+The frontend of the compiler uses a handcrafted tokenizer and parser. Contrary to popular belief, this approach often leads to faster iteration. You can power through implementation details without getting bogged down by things like grammar ambiguities, since you usually have enough context at each step to make the right decision. Error reporting tends to be significantly better, too, because that same context allows you to produce more meaningful messages for the user. Debugging is also more straightforward; you're not dealing with opaque parser generator state machines or tangled semantic actions, but rather stepping through plain, understandable code.
 
 Pyro has a strong nominal type system. Nominal means we use names to classify our types. The vast majority of programming languages have nominal type systems. Pyro also has constraints, which are essentially a specialized version of Rust's traits or Haskell's typeclasses. Currently, users cannot create their own constraints. The existing constraints are only used by `print`, `!`, and `?`. You can only use `print` on something that can be represented as a `String`. You can only use `!` on something that is a `Client` and you can only use `?` on something that is a `Server`. A type can have multiple constraints, but there is currently no constraint "inheritance" system. You cannot have a constraint that implies another constraint is also met. Nothing prevents this feature from being implemented; it simply does not exist yet.
 
@@ -401,3 +401,14 @@ Learning is most powerful when it's hands-on, and nothing is more hands-on than 
 Special thanks to Greg Young, the original author of the EventStore database, who suggested I look into π-calculus theory when I discussed my ideas for improving temporal query modeling.
 
 Pyro also draws significant inspiration from the Pict programming language, which is likely the first implementation of π-calculus theory.
+
+## References
+
+* Benjamin C. Pierce, David N. Turner [The Pict Programming Language]
+* [Pict Presentation Slides]
+* [Pict Tutorial]
+
+[You can view the Pyro compiler on Github]: https://github.com/YoEight/pyro
+[The Pict Programming Language]: https://www.cis.upenn.edu/~bcpierce/papers/pict/Html/Pict.html
+[Pict Presentation Slides]: https://www-sop.inria.fr/mimosa/Pascal.Zimmer/mobility/pict.pdf
+[Pict Tutorial]: https://www.cs.rpi.edu/academics/courses/spring04/dci/picttutorial.pdf
